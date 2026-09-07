@@ -37,16 +37,19 @@ use commonware_utils::{N3f1, NZU16, NZU32, NZU64, NZUsize, NonZeroDuration};
 use eigen_logging::log_level::LogLevel;
 use gas_killer_common::get_operator_states;
 use gas_killer_common::{
-    GasKillerTaskData, GasKillerValidator, IngressStalenessWindow, SignatureScheme,
-    SpeculativePrebuildConfig, ack_messages_per_second, agg_activity_timeout, agg_window,
-    load_key_from_file, p2p_message_backlog, p2p_quota_period, quorum_threshold_fraction,
-    rebroadcast_interval, round_timeout, schnorr_messages_per_second, schnorr_stage_timeout,
-    signature_scheme, storage_directory, task_ttl,
+    APPLICATION_NAMESPACE, ConfigMetrics, GasKillerTaskData, GasKillerValidator,
+    IngressStalenessWindow, SignatureScheme, SpeculativePrebuildConfig, ack_messages_per_second,
+    agg_activity_timeout, agg_window, config_fingerprint, load_key_from_file, p2p_message_backlog,
+    p2p_quota_period, quorum_threshold_fraction, rebroadcast_interval, round_timeout,
+    schnorr_messages_per_second, schnorr_stage_timeout, signature_scheme, storage_directory,
+    task_ttl,
 };
+use gas_killer_router::directive_metrics::CountingSender;
 use gas_killer_router::expiry::run_expiry_sweeper;
 use gas_killer_router::factories::{
     create_ingress, create_schnorr_submitter, create_submitter, requeue_incomplete_tasks,
 };
+use gas_killer_router::height_metrics::{HeightObserver, SAMPLE_INTERVAL};
 use gas_killer_router::metrics::MetricsCollector;
 use gas_killer_router::operator_http::{HealthState, build_operator_app};
 use gas_killer_router::schnorr_coordinator::{SchnorrCoordinator, schnorr_certified_channel};
@@ -57,9 +60,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-// Unique namespace to avoid message replay attacks.
-const APPLICATION_NAMESPACE: &[u8] = b"_COMMONWARE_AGGREGATION_";
 
 /// Maximum p2p message size. `TipAck`s are tiny; `TaskDirective::Announce` is
 /// bounded by the 128 KB combined calldata/storage-updates limit — 1 MB is
@@ -373,6 +373,10 @@ fn main() {
         // Custom Prometheus metrics — shared by ingress, sequencer, and submitter.
         let metrics = Arc::new(MetricsCollector::new());
 
+        // The sequencer's broadcast loop is upstream and can only report a directive that
+        // reached nobody; wrapping the sender is what makes a partial drop visible.
+        let directive_sender = CountingSender::new(directive_sender, Arc::clone(&metrics));
+
         // Shared validator: the sequencer uses it for EVMSketch enrichment; its
         // speculative pre-build loop warms the executor cache off the hot path.
         let validator = Arc::new(
@@ -390,7 +394,19 @@ fn main() {
         // State shared across sequencer / signing path / submitter.
         let assignments = shared_assignments::<GasKillerTaskData>();
         let dispatch_time: DispatchTime = Arc::new(Mutex::new(HashMap::new()));
-        let (resolution_sender, resolution_receiver) = resolution_channel();
+
+        // Resolutions run submitter -> observer -> sequencer rather than straight through, so
+        // every height's outcome is counted before the sequencer can act on it. The observer
+        // relies on that ordering to tell an abandoned height from a resolved one.
+        let (resolution_sender, observed_resolutions) = resolution_channel();
+        let (observer_sender, resolution_receiver) = resolution_channel();
+        let height_observer = HeightObserver::new(Arc::clone(&metrics));
+        {
+            let height_observer = height_observer.clone();
+            context.child("height_outcomes").spawn(move |_| {
+                height_observer.forward_resolutions(observed_resolutions, observer_sender)
+            });
+        }
 
         // HTTP ingress (env-gated, unchanged endpoints). The returned sender is
         // kept alive below so the task channel never closes while running
@@ -446,6 +462,24 @@ fn main() {
                     tip_reports,
                 )
                 .await;
+            });
+        }
+
+        // Window sampler: publishes the live height range, the oldest waiting height's age, and
+        // the tip floor from the operators' reports. Reads the same shared state the sequencer
+        // drives, so a stalled window is visible without touching the height loop.
+        {
+            let height_observer = height_observer.clone();
+            let assignments = Arc::clone(&assignments);
+            let dispatch_time = Arc::clone(&dispatch_time);
+            let tip_reports = tip_reports.clone();
+            context.child("window_sampler").spawn(move |_| {
+                height_observer.sample_forever(
+                    assignments,
+                    dispatch_time,
+                    tip_reports,
+                    SAMPLE_INTERVAL,
+                )
             });
         }
 
@@ -656,10 +690,13 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(8081);
         let healthz_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), healthz_port);
+        let fingerprint = config_fingerprint();
+        tracing::info!(%fingerprint, "configuration fingerprint");
         let health_state = HealthState {
             ready: Arc::clone(&ready),
             context: Arc::new(context.child("metrics_view")),
             metrics: Arc::clone(&metrics),
+            config_metrics: Arc::new(ConfigMetrics::new(&fingerprint)),
         };
         context.child("healthz").spawn(move |_| async move {
             let app = build_operator_app().with_state(health_state);

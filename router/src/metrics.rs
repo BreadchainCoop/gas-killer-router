@@ -34,6 +34,90 @@ pub fn chain_labels(chain: ChainRole) -> ChainLabels {
     [("chain", chain.name().to_string())]
 }
 
+/// Label set scoping a counter to one per-height disposition, rendered as `outcome="executed"`.
+type OutcomeLabels = [(&'static str, String); 1];
+
+/// A counter broken down by how an assigned aggregation height ended. Cardinality is the four
+/// [`HeightOutcome`] variants.
+pub type PerOutcomeCounter = Family<OutcomeLabels, Counter<u64, AtomicU64>>;
+
+/// The label set naming `outcome`, for indexing a [`PerOutcomeCounter`].
+pub fn outcome_labels(outcome: HeightOutcome) -> OutcomeLabels {
+    [("outcome", outcome.as_str().to_string())]
+}
+
+/// How an assigned aggregation height was finally disposed of.
+///
+/// `Executed`, `Skipped`, and `Foreign` mirror the `ResolutionKind` the submitter reports to the
+/// sequencer. `Superseded` has no `ResolutionKind` of its own: the sequencer abandons a height
+/// when the operators' reported tips prove the quorum is already past it, so the height ends
+/// without any certificate ever arriving for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeightOutcome {
+    /// A certificate carried the height's expected digest and on-chain settlement finished.
+    Executed,
+    /// A certificate carried the skip digest: the quorum abandoned the height and its task.
+    Skipped,
+    /// A certificate carried neither the expected digest nor the skip digest, or the height had
+    /// no assignment at all — a leftover from a previous router life.
+    Foreign,
+    /// Operator tip reports moved past the height before it could certify, so it can never
+    /// certify and the task is re-assigned higher.
+    Superseded,
+}
+
+impl HeightOutcome {
+    /// The `outcome` label value for this disposition.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::Skipped => "skipped",
+            Self::Foreign => "foreign",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// Label set scoping a counter to one directive-send result, rendered as `result="delivered"`.
+type SendResultLabels = [(&'static str, String); 1];
+
+/// A counter broken down by what happened to one recipient's copy of a directive. Cardinality is
+/// the three [`DirectiveSendResult`] variants.
+pub type PerSendResultCounter = Family<SendResultLabels, Counter<u64, AtomicU64>>;
+
+/// The label set naming `result`, for indexing a [`PerSendResultCounter`].
+pub fn send_result_labels(result: DirectiveSendResult) -> SendResultLabels {
+    [("result", result.as_str().to_string())]
+}
+
+/// What became of one recipient's copy of a broadcast task directive.
+///
+/// The p2p sender collapses all three cases into one return value — the list of peers it will
+/// attempt — so a partial drop is indistinguishable from a full delivery at the call site.
+/// Counting the cases apart is what separates "the operators are throttling us" from "the local
+/// send buffer refused the message" from a healthy broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectiveSendResult {
+    /// The recipient was within its rate limit and the local send was accepted.
+    Delivered,
+    /// The recipient's per-peer quota was exhausted, so its copy was dropped before sending.
+    RateLimited,
+    /// The recipient passed the rate-limit check but the local send was not accepted
+    /// (backpressure, or a closed sender), so nothing went out to it.
+    Rejected,
+}
+
+impl DirectiveSendResult {
+    /// The `result` label value for this outcome.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::RateLimited => "rate_limited",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 pub struct MetricsCollector {
     registry: Registry,
     /// Ingress requests that passed validation and were queued, by calling key.
@@ -103,6 +187,30 @@ pub struct MetricsCollector {
     pub executor_tx_send_seconds: Histogram,
     /// Time waiting for the verifyAndUpdate receipt to be mined (seconds).
     pub executor_receipt_confirmation_seconds: Histogram,
+    /// Aggregation heights currently assigned and not yet resolved.
+    pub in_flight_heights: Gauge<i64, AtomicI64>,
+    /// Lowest height currently assigned, or 0 when nothing is in flight. Paired with
+    /// [`Self::highest_assigned_height`] this is what makes a stalled window visible: both stay
+    /// pinned while heights stop resolving, where a healthy pipeline advances them together.
+    pub window_base: Gauge<i64, AtomicI64>,
+    /// Highest height ever assigned during this router life. Monotonic, so an idle router holds
+    /// the last value rather than reporting an empty window.
+    pub highest_assigned_height: Gauge<i64, AtomicI64>,
+    /// Age in whole seconds of the oldest height still awaiting its certificate, or 0 when
+    /// nothing is in flight.
+    pub height_age_seconds: Gauge<i64, AtomicI64>,
+    /// How assigned heights ended, by disposition.
+    pub height_outcomes: PerOutcomeCounter,
+    /// The `(f+1)`-th highest tip the operators have reported, which is the floor the sequencer
+    /// will not assign below. A height at or under this value can never certify, so a rising
+    /// safe tip is the cause behind an `outcome="superseded"` spike.
+    pub node_safe_tip: Gauge<i64, AtomicI64>,
+    /// Per-recipient outcomes of task-directive broadcasts, counted at the send site.
+    pub directive_sends: PerSendResultCounter,
+    /// Terminal-state transitions the store refused because the task had already settled. A
+    /// nonzero value means a task was settled twice and its row may carry another task's
+    /// payload, so it is never expected in a healthy deployment.
+    pub settlement_conflicts: Counter<u64, AtomicU64>,
 }
 
 impl MetricsCollector {
@@ -297,6 +405,62 @@ impl MetricsCollector {
             executor_receipt_confirmation_seconds.clone(),
         );
 
+        let in_flight_heights = Gauge::default();
+        registry.register(
+            "gas_killer_in_flight_heights",
+            "Aggregation heights currently assigned and not yet resolved",
+            in_flight_heights.clone(),
+        );
+
+        let window_base = Gauge::default();
+        registry.register(
+            "gas_killer_window_base",
+            "Lowest aggregation height currently assigned, or 0 when nothing is in flight",
+            window_base.clone(),
+        );
+
+        let highest_assigned_height = Gauge::default();
+        registry.register(
+            "gas_killer_highest_assigned_height",
+            "Highest aggregation height ever assigned during this router life",
+            highest_assigned_height.clone(),
+        );
+
+        let height_age_seconds = Gauge::default();
+        registry.register(
+            "gas_killer_height_age_seconds",
+            "Age in seconds of the oldest aggregation height still awaiting its certificate",
+            height_age_seconds.clone(),
+        );
+
+        let height_outcomes = Family::default();
+        registry.register(
+            "gas_killer_height_outcomes",
+            "Total assigned aggregation heights by final disposition",
+            height_outcomes.clone(),
+        );
+
+        let node_safe_tip = Gauge::default();
+        registry.register(
+            "gas_killer_node_safe_tip",
+            "Highest aggregation tip reachable per the operators' tip reports, the floor the sequencer will not assign below",
+            node_safe_tip.clone(),
+        );
+
+        let directive_sends = Family::default();
+        registry.register(
+            "gas_killer_directive_sends",
+            "Total per-recipient task-directive send attempts by result, counted at the send site",
+            directive_sends.clone(),
+        );
+
+        let settlement_conflicts = Counter::default();
+        registry.register(
+            "gas_killer_settlement_conflicts",
+            "Total terminal-state transitions refused because the task had already settled",
+            settlement_conflicts.clone(),
+        );
+
         Self {
             registry,
             ingress_accepted,
@@ -323,6 +487,14 @@ impl MetricsCollector {
             executor_supports_interface_seconds,
             executor_tx_send_seconds,
             executor_receipt_confirmation_seconds,
+            in_flight_heights,
+            window_base,
+            highest_assigned_height,
+            height_age_seconds,
+            height_outcomes,
+            node_safe_tip,
+            directive_sends,
+            settlement_conflicts,
         }
     }
 
@@ -415,5 +587,78 @@ mod tests {
 
         metrics.db_up.set(0);
         assert!(metrics.encode().contains("gas_killer_db_up 0"));
+    }
+
+    #[test]
+    fn window_gauges_report_the_assigned_height_range() {
+        let metrics = MetricsCollector::new();
+        metrics.in_flight_heights.set(4);
+        metrics.window_base.set(120);
+        metrics.highest_assigned_height.set(123);
+        metrics.height_age_seconds.set(87);
+        metrics.node_safe_tip.set(119);
+
+        let output = metrics.encode();
+        assert!(output.contains("gas_killer_in_flight_heights 4"));
+        assert!(output.contains("gas_killer_window_base 120"));
+        assert!(output.contains("gas_killer_highest_assigned_height 123"));
+        assert!(output.contains("gas_killer_height_age_seconds 87"));
+        assert!(output.contains("gas_killer_node_safe_tip 119"));
+    }
+
+    #[test]
+    fn height_outcomes_emit_one_series_per_disposition() {
+        let metrics = MetricsCollector::new();
+        for outcome in [
+            HeightOutcome::Executed,
+            HeightOutcome::Executed,
+            HeightOutcome::Skipped,
+            HeightOutcome::Foreign,
+            HeightOutcome::Superseded,
+        ] {
+            metrics
+                .height_outcomes
+                .get_or_create(&outcome_labels(outcome))
+                .inc();
+        }
+
+        let output = metrics.encode();
+        assert!(output.contains("gas_killer_height_outcomes_total{outcome=\"executed\"} 2"));
+        assert!(output.contains("gas_killer_height_outcomes_total{outcome=\"skipped\"} 1"));
+        assert!(output.contains("gas_killer_height_outcomes_total{outcome=\"foreign\"} 1"));
+        assert!(output.contains("gas_killer_height_outcomes_total{outcome=\"superseded\"} 1"));
+    }
+
+    #[test]
+    fn directive_sends_separate_delivery_from_the_two_drop_causes() {
+        let metrics = MetricsCollector::new();
+        metrics
+            .directive_sends
+            .get_or_create(&send_result_labels(DirectiveSendResult::Delivered))
+            .inc_by(2);
+        metrics
+            .directive_sends
+            .get_or_create(&send_result_labels(DirectiveSendResult::RateLimited))
+            .inc();
+
+        let output = metrics.encode();
+        assert!(output.contains("gas_killer_directive_sends_total{result=\"delivered\"} 2"));
+        assert!(output.contains("gas_killer_directive_sends_total{result=\"rate_limited\"} 1"));
+        // A cause that has not occurred has no series, so a panel shows only real drops.
+        assert!(!output.contains("gas_killer_directive_sends_total{result=\"rejected\"}"));
+    }
+
+    #[test]
+    fn settlement_conflicts_export_zero_until_one_happens() {
+        let metrics = MetricsCollector::new();
+        let output = metrics.encode();
+        assert!(output.contains("gas_killer_settlement_conflicts_total 0"));
+
+        metrics.settlement_conflicts.inc();
+        assert!(
+            metrics
+                .encode()
+                .contains("gas_killer_settlement_conflicts_total 1")
+        );
     }
 }

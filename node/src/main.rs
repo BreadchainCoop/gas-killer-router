@@ -40,11 +40,12 @@ use commonware_utils::ordered::{Map, Quorum as _, Set};
 use commonware_utils::{N3f1, NZU16, NZU32, NZU64, NZUsize, NonZeroDuration};
 use eigen_logging::log_level::LogLevel;
 use gas_killer_common::{
-    GasKillerTaskData, GasKillerValidator, OrchestratorConfig, SignatureScheme,
-    SpeculativePrebuildConfig, ValidatorMetrics, ack_messages_per_second, agg_activity_timeout,
-    agg_window, get_operator_states, load_key_from_file, load_orchestrator_config,
-    p2p_message_backlog, p2p_quota_period, rebroadcast_interval, round_timeout,
-    schnorr_messages_per_second, signature_scheme, storage_directory,
+    APPLICATION_NAMESPACE, ConfigMetrics, GasKillerTaskData, GasKillerValidator,
+    OrchestratorConfig, SignatureScheme, SpeculativePrebuildConfig, ValidatorMetrics,
+    ack_messages_per_second, agg_activity_timeout, agg_window, config_fingerprint,
+    get_operator_states, load_key_from_file, load_orchestrator_config, p2p_message_backlog,
+    p2p_quota_period, rebroadcast_interval, round_timeout, schnorr_messages_per_second,
+    signature_scheme, storage_directory,
 };
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -54,9 +55,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::digest::DigestResolver;
-
-/// Unique namespace to avoid message replay attacks
-const APPLICATION_NAMESPACE: &[u8] = b"_COMMONWARE_AGGREGATION_";
 
 /// P2P channel carrying the aggregation engine's `TipAck` gossip (bls mode only).
 const ENGINE_CHANNEL: u64 = 0;
@@ -76,6 +74,9 @@ struct HealthState {
     /// through a shared handle.
     context: Arc<tokio::Context>,
     validator_metrics: Arc<ValidatorMetrics>,
+    /// This process's configuration fingerprint, published identically by every operator and
+    /// the router so a split fleet is one query across the deployment.
+    config_metrics: Arc<ConfigMetrics>,
 }
 
 /// Liveness probe — always 200 if the process is running.
@@ -92,10 +93,12 @@ async fn readyz_handler(State(s): State<HealthState>) -> StatusCode {
     }
 }
 
-/// Prometheus metrics endpoint — commonware runtime metrics + node validator timing.
+/// Prometheus metrics endpoint — commonware runtime metrics, node validator timing, and this
+/// process's configuration fingerprint.
 async fn metrics_handler(State(s): State<HealthState>) -> impl IntoResponse {
     let mut output = s.context.encode();
     output.push_str(&s.validator_metrics.encode());
+    output.push_str(&s.config_metrics.encode());
     (
         [(
             header::CONTENT_TYPE,
@@ -702,10 +705,13 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(8081);
         let healthz_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), healthz_port);
+        let fingerprint = config_fingerprint();
+        tracing::info!(%fingerprint, "configuration fingerprint");
         let health_state = HealthState {
             ready: Arc::clone(&ready),
             context: Arc::new(context.child("metrics_view")),
             validator_metrics,
+            config_metrics: Arc::new(ConfigMetrics::new(&fingerprint)),
         };
         context.child("healthz").spawn(move |_| async move {
             let app = Router::new()

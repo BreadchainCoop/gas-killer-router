@@ -1,6 +1,7 @@
 //! Shared configuration types and utilities for Gas Killer AVS components
 
 use commonware_avs_eigenlayer::{EigenStakingClient, QuorumInfo};
+use commonware_cryptography::{Hasher, Sha256};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -546,6 +547,72 @@ fn parse_sim_profile(raw: Option<&str>) -> gas_analyzer::SimProfile {
             panic!("GK_SIM_PROFILE must be 'chain' or 'unbounded', got '{other}'")
         }
     }
+}
+
+/// Namespace every quorum signature in a deployment is bound to.
+///
+/// Signatures produced under one namespace are not verifiable under another, so the router and
+/// every operator must agree on it. Defined here rather than per binary so the two cannot drift.
+pub const APPLICATION_NAMESPACE: &[u8] = b"_COMMONWARE_AGGREGATION_";
+
+/// Version of the task-directive wire format the router speaks and the operators parse.
+///
+/// The directive encoding carries no version byte of its own: an unknown variant tag decodes to
+/// an error the receiver logs and ignores, so a mismatch is silent rather than fatal. Carrying
+/// the version in the config fingerprint is what makes a mixed fleet visible. Bump this whenever
+/// the directive encoding changes.
+pub const DIRECTIVE_WIRE_VERSION: u32 = 0;
+
+/// A short digest of every setting that must be identical on the router and all operators.
+///
+/// Each input either feeds the task digest (the simulation profile, the state encoding, the
+/// namespace) or determines which heights a binary will sign at all (the scheme, the window, the
+/// directive format). A fleet running two values of any of them does not fail loudly: peers stay
+/// connected, quorum simply never forms, and the pipeline stalls while every pod reports healthy.
+///
+/// Exported as a label so a split is one query — more than one distinct fingerprint across the
+/// deployment means the fleet disagrees.
+pub fn config_fingerprint() -> String {
+    fingerprint_of(
+        &format!("{:?}", sim_profile()),
+        &format!("{:?}", state_encoding()),
+        &format!("{:?}", signature_scheme()),
+        APPLICATION_NAMESPACE,
+        agg_window().get(),
+        DIRECTIVE_WIRE_VERSION,
+    )
+}
+
+/// Hashes the consensus-critical settings into the value [`config_fingerprint`] publishes.
+///
+/// Field names are part of the hashed input so two settings swapping values cannot collide, and
+/// the namespace is hex-encoded because it is arbitrary bytes.
+fn fingerprint_of(
+    sim_profile: &str,
+    state_encoding: &str,
+    signature_scheme: &str,
+    application_namespace: &[u8],
+    agg_window: u64,
+    directive_wire_version: u32,
+) -> String {
+    let namespace: String = application_namespace
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let canonical = format!(
+        "sim_profile={sim_profile};state_encoding={state_encoding};\
+         signature_scheme={signature_scheme};application_namespace={namespace};\
+         agg_window={agg_window};directive_wire_version={directive_wire_version}"
+    );
+
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Default quorum threshold numerator/denominator used when `QUORUM_THRESHOLD` /
@@ -1218,6 +1285,82 @@ mod tests {
             Some(300),
             "the effective window is the one admission enforces"
         );
+    }
+
+    /// The consensus-critical settings of a healthy fleet, as `fingerprint_of` arguments.
+    fn healthy_inputs() -> (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [u8],
+        u64,
+        u32,
+    ) {
+        ("Chain", "Legacy", "Bls", b"_COMMONWARE_AGGREGATION_", 8, 0)
+    }
+
+    fn fingerprint(
+        inputs: (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static [u8],
+            u64,
+            u32,
+        ),
+    ) -> String {
+        fingerprint_of(inputs.0, inputs.1, inputs.2, inputs.3, inputs.4, inputs.5)
+    }
+
+    #[test]
+    fn the_fingerprint_is_a_short_stable_hex_digest() {
+        let first = fingerprint(healthy_inputs());
+        assert_eq!(first, fingerprint(healthy_inputs()));
+        assert_eq!(first.len(), 16);
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+    }
+
+    #[test]
+    fn changing_any_single_setting_changes_the_fingerprint() {
+        let healthy = fingerprint(healthy_inputs());
+
+        let mut divergent = healthy_inputs();
+        divergent.0 = "Unbounded";
+        assert_ne!(fingerprint(divergent), healthy, "sim profile");
+
+        let mut divergent = healthy_inputs();
+        divergent.1 = "PrestateNet";
+        assert_ne!(fingerprint(divergent), healthy, "state encoding");
+
+        let mut divergent = healthy_inputs();
+        divergent.2 = "Schnorr";
+        assert_ne!(fingerprint(divergent), healthy, "signature scheme");
+
+        let mut divergent = healthy_inputs();
+        divergent.3 = b"_SOMETHING_ELSE_";
+        assert_ne!(fingerprint(divergent), healthy, "application namespace");
+
+        let mut divergent = healthy_inputs();
+        divergent.4 = 4;
+        assert_ne!(fingerprint(divergent), healthy, "agg window");
+
+        let mut divergent = healthy_inputs();
+        divergent.5 = 1;
+        assert_ne!(fingerprint(divergent), healthy, "directive wire version");
+    }
+
+    #[test]
+    fn settings_cannot_swap_values_without_changing_the_fingerprint() {
+        // Field names are hashed alongside the values, so a scheme named "Legacy" and an
+        // encoding named "Bls" is a different fleet from the reverse.
+        let mut swapped = healthy_inputs();
+        swapped.1 = "Bls";
+        swapped.2 = "Legacy";
+        assert_ne!(fingerprint(swapped), fingerprint(healthy_inputs()));
     }
 
     #[test]

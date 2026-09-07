@@ -17,6 +17,7 @@ use axum::{
     routing::get,
 };
 use commonware_runtime::Metrics as _;
+use gas_killer_common::ConfigMetrics;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,6 +29,9 @@ pub struct HealthState {
     /// `tokio::Context` is `!Clone` in 2026.5.0; `encode()` works through a shared handle.
     pub context: Arc<commonware_runtime::tokio::Context>,
     pub metrics: Arc<MetricsCollector>,
+    /// This process's configuration fingerprint, published identically by the router and every
+    /// operator so a split fleet is one query across the deployment.
+    pub config_metrics: Arc<ConfigMetrics>,
 }
 
 /// Liveness probe: `200` whenever the process is running.
@@ -82,16 +86,18 @@ pub async fn readyz_handler(State(state): State<HealthState>) -> StatusCode {
     }
 }
 
-/// Prometheus scrape endpoint: the commonware runtime's metrics followed by the router's own.
+/// Prometheus scrape endpoint: the commonware runtime's metrics, then the router's own, then
+/// this process's configuration fingerprint.
 #[utoipa::path(
     get,
     path = "/metrics",
     tag = "Health",
     operation_id = "getMetrics",
     summary = "Prometheus metrics",
-    description = "Prometheus text exposition of the commonware runtime metrics followed by the \
-                   router's own. Not JSON, and not versioned as part of the API: metric names may \
-                   change with the code that emits them.",
+    description = "Prometheus text exposition of the commonware runtime metrics, then the \
+                   router's own, then this process's configuration fingerprint. Not JSON, and \
+                   not versioned as part of the API: metric names may change with the code that \
+                   emits them.",
     servers(
         (url = "http://localhost:8081", description = "Operator port (`HEALTHZ_PORT`)")
     ),
@@ -107,6 +113,7 @@ pub async fn readyz_handler(State(state): State<HealthState>) -> StatusCode {
 pub async fn metrics_handler(State(state): State<HealthState>) -> impl IntoResponse {
     let mut output = state.context.encode();
     output.push_str(&state.metrics.encode());
+    output.push_str(&state.config_metrics.encode());
     (
         [(
             header::CONTENT_TYPE,

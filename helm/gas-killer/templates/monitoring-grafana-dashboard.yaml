@@ -571,6 +571,202 @@ data:
             "colorMode": "background",
             "graphMode": "area"
           }
+        },
+        {
+          "id": 70,
+          "type": "text",
+          "title": "Window and Heights",
+          "gridPos": { "x": 0, "y": 75, "w": 24, "h": 1 },
+          "options": { "mode": "markdown", "content": "## Window and Heights\n\nThe aggregation pipeline's live shape. A wedged pipeline looks healthy everywhere else — pods up, memory flat, nothing restarting — and shows up only here, as a window whose base and highest-assigned height stop advancing together while the queue still has work.\n\nHeight outcomes are the disposition of every height the router assigned. `executed` is the healthy path. `skipped` means the quorum abandoned the height, so the task produced nothing; a sustained skip ratio above ~1% of certified heights is the signal that directives are not arriving. `foreign` is a certificate left over from a previous router life. `superseded` means the operators' reported tips moved past a height the router was still driving, which the safe-tip series explains.\n\nDirective sends are counted per recipient at the send site, because the p2p sender reports a partial drop and a full delivery identically. `rate_limited` is the operators' per-peer quota filtering our copy out before it is sent; `rejected` is our own send buffer refusing the message. Both are invisible upstream. The rate-limited messages panel is the opposite end of the same story: it counts what the *receiving* peer throttled, where the remedy is to sleep the connection rather than drop the message." }
+        },
+        {
+          "id": 71,
+          "type": "timeseries",
+          "title": "Heights In Flight",
+          "description": "Aggregation heights assigned and not yet resolved. One at a time is the current design; this is the series that shows the window actually opening when SEQUENCER_WINDOW is raised.",
+          "gridPos": { "x": 0, "y": 76, "w": 8, "h": 8 },
+          "targets": [
+            {
+              "expr": "gas_killer_in_flight_heights",
+              "legendFormat": "in flight"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 72,
+          "type": "timeseries",
+          "title": "Window Base vs Highest Assigned",
+          "description": "The edges of the live window against the router engine's contiguous tip. All three advancing together is healthy. Base and highest pinned while the queue is non-empty is a wedge; the engine tip falling behind the window base means heights are certifying out of order and the router can no longer observe the certificates it is waiting on.",
+          "gridPos": { "x": 8, "y": 76, "w": 8, "h": 8 },
+          "targets": [
+            {
+              "expr": "gas_killer_window_base",
+              "legendFormat": "window base"
+            },
+            {
+              "expr": "gas_killer_highest_assigned_height",
+              "legendFormat": "highest assigned"
+            },
+            {
+              "expr": "engine_tip{job=~\".*gas-killer.*router.*\"}",
+              "legendFormat": "engine tip (contiguous)"
+            },
+            {
+              "expr": "gas_killer_node_safe_tip",
+              "legendFormat": "operator safe tip"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 73,
+          "type": "timeseries",
+          "title": "Oldest Height Age",
+          "description": "How long the oldest unresolved height has been waiting. Should stay within ROUND_TIMEOUT plus settlement time; growing past a few multiples of ROUND_TIMEOUT means the height is never going to resolve on its own.",
+          "gridPos": { "x": 16, "y": 76, "w": 8, "h": 8 },
+          "targets": [
+            {
+              "expr": "gas_killer_height_age_seconds",
+              "legendFormat": "oldest height"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "id": 74,
+          "type": "timeseries",
+          "title": "Height Outcomes / min",
+          "description": "Final disposition of every assigned height. Anything other than `executed` means a task produced no on-chain effect.",
+          "gridPos": { "x": 0, "y": 84, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (outcome) (rate(gas_killer_height_outcomes_total[5m])) * 60",
+              "legendFormat": "{{ "{{" }} outcome {{ "}}" }}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 75,
+          "type": "timeseries",
+          "title": "Directive Sends / min by Result",
+          "description": "Per-recipient outcomes of task-directive broadcasts, counted at the send site. Any sustained rate_limited is the split-digest hazard: an operator that misses an Announce and later sees a directive for a higher height votes to skip the height it missed, and that stall does not clear on its own.",
+          "gridPos": { "x": 12, "y": 84, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (result) (rate(gas_killer_directive_sends_total[5m])) * 60",
+              "legendFormat": "{{ "{{" }} result {{ "}}" }}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 76,
+          "type": "timeseries",
+          "title": "P2P Messages Rate-Limited (10m)",
+          "description": "Messages the receiving peer throttled, by channel: data_0 is the engine's ack gossip, data_1 the task directives, data_2 the interactive Schnorr rounds. The receive side does not drop a throttled message, it sleeps the whole connection — head-of-line blocking every channel on it, ping included — so any sustained value here is worse than it looks. Raise the receive side's quota before the send side's.",
+          "gridPos": { "x": 0, "y": 92, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (message) (increase(network_spawner_messages_rate_limited_total[10m]))",
+              "legendFormat": "{{ "{{" }} message {{ "}}" }}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 77,
+          "type": "timeseries",
+          "title": "Operator Certified vs Skipped / min",
+          "description": "What the operators actually signed, from their own reporters. The skip ratio against certified is the ramp gate for raising the window: hold it under 1%.",
+          "gridPos": { "x": 12, "y": 92, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum(rate(reporter_certified_total[5m])) * 60",
+              "legendFormat": "certified"
+            },
+            {
+              "expr": "sum(rate(reporter_skipped_total[5m])) * 60",
+              "legendFormat": "skipped"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 78,
+          "type": "timeseries",
+          "title": "Engine Acks and Digests / min by Status",
+          "description": "Aggregation engine internals from the runtime registry. A rising ack failure status is the direct evidence of a digest disagreement — peers stay connected through it, so nothing else reports it.",
+          "gridPos": { "x": 0, "y": 100, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (status) (rate(engine_acks_total[5m])) * 60",
+              "legendFormat": "ack {{ "{{" }} status {{ "}}" }}"
+            },
+            {
+              "expr": "sum by (status) (rate(engine_digest_total[5m])) * 60",
+              "legendFormat": "digest {{ "{{" }} status {{ "}}" }}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 79,
+          "type": "stat",
+          "title": "Config Fingerprints",
+          "description": "Distinct consensus-critical configurations across the deployment. Must be exactly 1. More than one means the router and operators disagree on a setting that feeds the task digest or decides which heights they will sign, which does not fail loudly — quorum simply never forms while every pod reports healthy. Recovery is a coordinated whole-fleet restart, so catch it here.",
+          "gridPos": { "x": 12, "y": 100, "w": 6, "h": 8 },
+          "targets": [{
+            "expr": "count(count by (fingerprint) (gas_killer_config_fingerprint))",
+            "legendFormat": "fingerprints"
+          }],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "graphMode": "none"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": 0 },
+                  { "color": "green", "value": 1 },
+                  { "color": "red", "value": 2 }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 80,
+          "type": "stat",
+          "title": "Settlement Conflicts",
+          "description": "Terminal-state transitions the store refused because the task had already settled. Must be 0. A nonzero value means a task row was written twice and may carry another task's payload.",
+          "gridPos": { "x": 18, "y": 100, "w": 6, "h": 8 },
+          "targets": [{
+            "expr": "increase(gas_killer_settlement_conflicts_total[$__range])",
+            "legendFormat": "conflicts"
+          }],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "graphMode": "area"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": 0 },
+                  { "color": "red", "value": 1 }
+                ]
+              }
+            }
+          }
         }
       ]
     }

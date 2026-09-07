@@ -242,7 +242,7 @@ kubectl get svc ingress-nginx-controller \
 
 ### Deploy with monitoring enabled
 
-An example override file is provided at `helm/gas-killer/testnet-monitoring-overrides.yaml`.
+The testnet and mainnet override files (`testnet-overrides.yaml`, `mainnet-overrides.yaml`) already enable monitoring and the Grafana ingress.
 
 ```bash
 helm upgrade --install gas-killer ./helm/gas-killer \
@@ -268,10 +268,12 @@ kubectl port-forward svc/gas-killer-grafana 3000:80
 Then open `http://localhost:3000` and log in with username `admin` and the password you set.
 
 The **Gas Killer** dashboard is pre-loaded automatically via the Grafana sidecar. It includes:
-- Router and node up/down status
-- Pod restart counts
-- CPU and memory usage per pod
-- Placeholder panels for aggregation and ingress metrics (populated once custom metrics are instrumented)
+- Router and node up/down status, database and RPC health
+- Pod restart counts, CPU and memory usage per pod
+- Aggregation throughput, end-to-end and per-phase latency breakdowns
+- Ingress request rates and per-API-key accept/reject series
+- Window and height observability: concurrent heights, window base against the engine tip,
+  per-height outcomes, directive delivery, and the configuration fingerprint across the fleet
 
 ### Verifying scrape targets
 

@@ -582,7 +582,7 @@
           "Health"
         ],
         "summary": "Prometheus metrics",
-        "description": "Prometheus text exposition of the commonware runtime metrics followed by the router's own. Not JSON, and not versioned as part of the API: metric names may change with the code that emits them.",
+        "description": "Prometheus text exposition of the commonware runtime metrics, then the router's own, then this process's configuration fingerprint. Not JSON, and not versioned as part of the API: metric names may change with the code that emits them.",
         "operationId": "getMetrics",
         "responses": {
           "200": {

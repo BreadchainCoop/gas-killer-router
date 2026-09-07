@@ -251,6 +251,50 @@ Removed after the aggregation migration:
 
 Operator (node) key files are generated automatically by the Docker setup and do not need to be set manually.
 
+### Metrics
+
+Both binaries serve Prometheus text exposition on `/metrics` at `HEALTHZ_PORT` (default 8081):
+the commonware runtime's own registries, then the process's custom metrics, then its
+configuration fingerprint. The Helm chart scrapes both at 15s and dashboards them.
+
+Metrics from the runtime registries are named after the subsystem that registered them —
+`engine_*` for the aggregation engine (both binaries), `reporter_*` for an operator's
+certificate reporter, `network_*` for p2p. The router's own metrics are all prefixed
+`gas_killer_`.
+
+The pipeline's shape, as opposed to the cost of one round:
+
+| Metric | Meaning |
+|---|---|
+| `gas_killer_in_flight_heights` | Heights assigned and not yet resolved |
+| `gas_killer_window_base`, `gas_killer_highest_assigned_height` | Edges of the live window. Both pinned while work is queued is a wedge |
+| `gas_killer_height_age_seconds` | Age of the oldest unresolved height |
+| `gas_killer_height_outcomes_total{outcome}` | Final disposition per height: `executed`, `skipped`, `foreign`, `superseded` |
+| `gas_killer_node_safe_tip` | Tip floor from the operators' reports; explains a `superseded` spike |
+| `gas_killer_directive_sends_total{result}` | Per-recipient directive delivery: `delivered`, `rate_limited`, `rejected` |
+| `gas_killer_settlement_conflicts_total` | Terminal-state transitions the store refused. Must be 0 |
+| `gas_killer_config_fingerprint{fingerprint}` | Always 1, labelled with this process's consensus-critical config |
+| `engine_tip` | The engine's contiguous tip: the lowest height without a certificate |
+| `reporter_certified_total`, `reporter_skipped_total` | What the operators actually signed |
+| `network_spawner_messages_rate_limited_total{peer,message}` | Messages the *receiving* peer throttled, by channel (`data_0` acks, `data_1` directives, `data_2` Schnorr) |
+
+Two of these need reading together rather than alone.
+
+`gas_killer_directive_sends_total` and `network_spawner_messages_rate_limited_total` are opposite
+ends of the same channel and neither substitutes for the other. The send-side counter exists
+because the p2p sender returns the peers it will attempt and silently omits the ones over quota,
+so a partial drop and a full delivery are indistinguishable at the call site — and a dropped
+`Announce` is how an operator ends up voting to skip a height everyone else signed. The
+receive-side counter is the peer's own view, where a throttled message is not dropped but sleeps
+the entire connection, blocking every channel on it.
+
+`gas_killer_config_fingerprint` is a hash of the settings that must match across the router and
+every operator: `GK_SIM_PROFILE`, `STATE_ENCODING`, `SIGNATURE_SCHEME`, the application
+namespace, `AGG_WINDOW`, and the directive wire version. A fleet that disagrees on any of them
+does not fail loudly — peers stay connected, quorum never forms, and every pod reports healthy —
+so `count(count by (fingerprint) (gas_killer_config_fingerprint))` must be exactly 1. It is also
+the pre-flight check for a rolling upgrade: none of these may be changed on a live fleet.
+
 ## Ingress Mode
 
 Enable HTTP endpoints for external task requests. These endpoints are specified in

@@ -15,11 +15,11 @@
 #   - gas_killer_p2p_round_trip_seconds        (router)
 #   - gas_killer_node_evmsketch_duration_seconds (node)
 #   - gas_killer_storage_computation_seconds    (router creator)
-#   - gas_killer_task_queue_depth               (router)
+#   - gas_killer_queue_depth               (router)
 #
 # Interpretation guide:
 #   p2p_transport_estimate ≈ round_trip_p99 − node_evmsketch_p99
-#   If task_queue_depth > 0 during burst_5, the 1 msg/sec rate limit is the bottleneck.
+#   If queue_depth > 0 during burst_5, the 1 msg/sec rate limit is the bottleneck.
 
 router_url           = "https://testnet.gaskiller.xyz"
 http_rpc             = "$GNOSIS_RPC_URL"
@@ -73,7 +73,7 @@ delay_between_ms = 5000
 #
 # Purpose: detect rate-limit queuing (Quota::per_second(1)) and backlog saturation.
 # All 5 requests hit the ingress simultaneously. The router processes them one at a
-# time; tasks 2-5 will queue. Watch task_queue_depth in Grafana: if it stays > 0
+# time; tasks 2-5 will queue. Watch queue_depth in Grafana: if it stays > 0
 # for > 1 s per queued task, the P2P rate limit is the bottleneck.
 #
 # verify = false so the HTTP client doesn't block waiting for on-chain confirmation
