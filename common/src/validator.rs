@@ -2,10 +2,11 @@ use alloy_provider::Provider;
 use anyhow::Result;
 use commonware_cryptography::sha256::Digest;
 use commonware_runtime::telemetry::metrics::encoding::text::encode;
-use commonware_runtime::telemetry::metrics::raw::Histogram;
+use commonware_runtime::telemetry::metrics::raw::{Counter, Family, Histogram};
 use commonware_runtime::telemetry::metrics::registry::Registry;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -39,13 +40,99 @@ fn digest_cache_key(task: &GasKillerTaskData) -> DigestCacheKey {
         task.call_data.clone(),
     )
 }
-use gas_analyzer::{EvmSketchExecutorCache, call_to_encoded_state_updates_with_evmsketch_profiled};
+use gas_analyzer::{
+    EncodePhaseTimings, EvmSketchExecutorCache, Extraction,
+    call_to_encoded_state_updates_with_evmsketch_profiled,
+};
 
-/// Prometheus metrics for validator timing, exposed on the node's /metrics endpoint.
+/// Label set scoping a phase histogram to the extractor that ran, rendered as
+/// `extraction="prestate_net"`.
+type ExtractionLabels = [(&'static str, String); 1];
+
+/// A phase-duration histogram broken down by extractor. Cardinality is the three
+/// `gas_analyzer::Extraction` variants.
+pub type PerExtractionHistogram = Family<ExtractionLabels, Histogram>;
+
+/// The label set naming `extraction`.
+fn extraction_labels(extraction: Extraction) -> ExtractionLabels {
+    [("extraction", extraction.as_str().to_string())]
+}
+
+/// Label set scoping a counter to a cache outcome, rendered as `result="hit"`.
+type CacheResultLabels = [(&'static str, String); 1];
+
+/// A counter broken down by cache outcome. Cardinality is two.
+pub type PerCacheResultCounter = Family<CacheResultLabels, Counter<u64, AtomicU64>>;
+
+/// The label set naming `result`, for a cache hit or miss.
+fn cache_result_labels(hit: bool) -> CacheResultLabels {
+    [("result", if hit { "hit" } else { "miss" }.to_string())]
+}
+
+// Per-phase bucket constructors. A `Family` of histograms needs a plain `fn` to build each new
+// series (`Histogram` has no meaningful default), and each phase gets its own buckets because
+// they span very different scales — one shared set would leave most samples in a single bucket.
+
+/// Network plus remote node CPU, and a struct-log trace can be enormous.
+fn trace_fetch_buckets() -> Histogram {
+    Histogram::new([0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, 120.0])
+}
+
+/// Local CPU, `O(execution steps)`.
+fn parse_buckets() -> Histogram {
+    Histogram::new([
+        0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
+    ])
+}
+
+/// Tens of milliseconds on a miss, near zero on a hit — so the low end needs resolution.
+fn executor_build_buckets() -> Histogram {
+    Histogram::new([0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0])
+}
+
+/// One `eth_getProof` round-trip per hinted address.
+fn state_prefetch_buckets() -> Histogram {
+    Histogram::new([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0])
+}
+
+/// Local revm, plus any cold-miss state reads the prefetch did not cover.
+fn revm_estimate_buckets() -> Histogram {
+    Histogram::new([0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0])
+}
+
+/// Prometheus metrics for validator timing, exposed on the /metrics endpoint of whichever
+/// binary owns the validator.
+///
+/// Both the router and the operators run gas analysis, and both attach one of these, so every
+/// series here carries the same names on both sides and is separated by the scrape target.
+///
+/// The per-phase histograms exist because the total tells you a task was slow without telling
+/// you what to do about it. The fetch phases are network plus *remote* node CPU; the parse and
+/// estimate phases are local CPU with no yield points. Which dominates for a given workload
+/// decides whether to buy bandwidth or cores, and whether `prestate-net` is worth defaulting to.
 pub struct ValidatorMetrics {
     registry: Registry,
     /// Duration of the EVMSketch gas-analysis call (cache-miss path only).
     pub evmsketch_duration_seconds: Histogram,
+    /// Time awaiting trace RPCs: `debug_traceCall` on the struct-log path, or the two cheap
+    /// tracers on the prestate path.
+    pub trace_fetch_seconds: PerExtractionHistogram,
+    /// Time turning struct logs into state updates. Never observed on the net form, which
+    /// fetches no struct-log trace, so an empty `prestate_net` series is the expected shape.
+    pub parse_seconds: PerExtractionHistogram,
+    /// Time building the revm executor. Read alongside
+    /// [`Self::executor_cache`] — a hit makes this near zero.
+    pub executor_build_seconds: PerExtractionHistogram,
+    /// Time prefetching account and slot state for the gas estimate.
+    pub state_prefetch_seconds: PerExtractionHistogram,
+    /// Time executing the payload under revm to price it.
+    pub revm_estimate_seconds: PerExtractionHistogram,
+    /// Executor-cache outcomes. The speculative pre-build's whole purpose is to turn these into
+    /// hits, so this is how its contribution becomes visible.
+    pub executor_cache: PerCacheResultCounter,
+    /// Digest-cache outcomes. A hit skips the entire analysis, so the phase histograms cannot be
+    /// interpreted without knowing how often that happened.
+    pub digest_cache: PerCacheResultCounter,
 }
 
 impl ValidatorMetrics {
@@ -55,13 +142,111 @@ impl ValidatorMetrics {
             Histogram::new([0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, 120.0]);
         registry.register(
             "gas_killer_node_evmsketch_duration_seconds",
-            "Duration of gas analysis (EVMSketch + RPC calls) on the node, cache-miss path only. Excludes chain detection.",
+            "Duration of gas analysis (EVMSketch + RPC calls), cache-miss path only. Excludes chain detection.",
             evmsketch_duration_seconds.clone(),
         );
+
+        let trace_fetch_seconds =
+            Family::new_with_constructor(trace_fetch_buckets as fn() -> Histogram);
+        registry.register(
+            "gas_killer_evmsketch_trace_fetch_seconds",
+            "Time awaiting trace RPCs during gas analysis, by extractor",
+            trace_fetch_seconds.clone(),
+        );
+
+        let parse_seconds = Family::new_with_constructor(parse_buckets as fn() -> Histogram);
+        registry.register(
+            "gas_killer_evmsketch_parse_seconds",
+            "Time parsing struct logs into state updates, by extractor",
+            parse_seconds.clone(),
+        );
+
+        let executor_build_seconds =
+            Family::new_with_constructor(executor_build_buckets as fn() -> Histogram);
+        registry.register(
+            "gas_killer_evmsketch_executor_build_seconds",
+            "Time resolving the revm executor from the cache or building it, by extractor",
+            executor_build_seconds.clone(),
+        );
+
+        let state_prefetch_seconds =
+            Family::new_with_constructor(state_prefetch_buckets as fn() -> Histogram);
+        registry.register(
+            "gas_killer_evmsketch_state_prefetch_seconds",
+            "Time prefetching account and slot state for the gas estimate, by extractor",
+            state_prefetch_seconds.clone(),
+        );
+
+        let revm_estimate_seconds =
+            Family::new_with_constructor(revm_estimate_buckets as fn() -> Histogram);
+        registry.register(
+            "gas_killer_evmsketch_revm_estimate_seconds",
+            "Time executing the payload under revm to price it, by extractor",
+            revm_estimate_seconds.clone(),
+        );
+
+        let executor_cache = Family::default();
+        registry.register(
+            "gas_killer_evmsketch_executor_cache",
+            "Total executor-cache lookups by outcome",
+            executor_cache.clone(),
+        );
+
+        let digest_cache = Family::default();
+        registry.register(
+            "gas_killer_evmsketch_digest_cache",
+            "Total digest-cache lookups by outcome; a hit skips the whole analysis",
+            digest_cache.clone(),
+        );
+
         Self {
             registry,
             evmsketch_duration_seconds,
+            trace_fetch_seconds,
+            parse_seconds,
+            executor_build_seconds,
+            state_prefetch_seconds,
+            revm_estimate_seconds,
+            executor_cache,
+            digest_cache,
         }
+    }
+
+    /// Records one analysis run's phase costs and cache outcome.
+    ///
+    /// Kept here rather than at the call site so the router and the operators cannot drift in
+    /// what they observe.
+    pub fn observe_analysis(&self, phases: &AnalysisPhases) {
+        let labels = extraction_labels(phases.extraction);
+        self.trace_fetch_seconds
+            .get_or_create(&labels)
+            .observe(phases.timings.trace_fetch.as_secs_f64());
+        // The net form never fetches a struct-log trace, so recording a zero would invent a
+        // data point for work that did not happen.
+        if phases.extraction != Extraction::PrestateNet {
+            self.parse_seconds
+                .get_or_create(&labels)
+                .observe(phases.timings.parse.as_secs_f64());
+        }
+        self.executor_build_seconds
+            .get_or_create(&labels)
+            .observe(phases.timings.executor_build.as_secs_f64());
+        self.state_prefetch_seconds
+            .get_or_create(&labels)
+            .observe(phases.timings.prefetch.as_secs_f64());
+        self.revm_estimate_seconds
+            .get_or_create(&labels)
+            .observe(phases.timings.revm_estimate.as_secs_f64());
+        self.executor_cache
+            .get_or_create(&cache_result_labels(phases.executor_cache_hit))
+            .inc();
+    }
+
+    /// Records one digest-cache lookup.
+    pub fn observe_digest_cache(&self, hit: bool) {
+        self.digest_cache
+            .get_or_create(&cache_result_labels(hit))
+            .inc();
     }
 
     pub fn encode(&self) -> String {
@@ -102,6 +287,21 @@ fn ensure_program_applies_something(
     Ok(())
 }
 
+/// What one gas-analysis run cost, and which extractor produced it.
+///
+/// `trace_fetch` and `executor_build` in [`Self::timings`] overlap — they are the two branches of
+/// one `try_join!` inside the analyzer — so they must never be summed. See
+/// [`gas_analyzer::EncodePhaseTimings`].
+#[derive(Debug, Clone, Copy)]
+pub struct AnalysisPhases {
+    /// Which extractor produced the state-update program.
+    pub extraction: Extraction,
+    /// Whether the revm executor came from the cache instead of being built.
+    pub executor_cache_hit: bool,
+    /// What each phase of the run cost.
+    pub timings: EncodePhaseTimings,
+}
+
 /// Result of gas analysis containing storage updates and gas information
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {
@@ -113,6 +313,8 @@ pub struct AnalysisResult {
     pub gas_estimate: u64,
     /// The block height at which the analysis was performed
     pub block_height: u64,
+    /// What the run cost, by phase.
+    pub phases: AnalysisPhases,
 }
 
 /// Extra executor-cache slots per chain beyond the staleness window.
@@ -446,6 +648,7 @@ impl GasKillerValidator {
         // Call gas-analyzer to get storage updates and gas estimate using EvmSketch.
         // The executor cache eliminates the build cost on repeated requests at the
         // same block height.
+        let started = Instant::now();
         let analysis = call_to_encoded_state_updates_with_evmsketch_profiled(
             &self.executor_cache,
             rpc_url,
@@ -456,6 +659,19 @@ impl GasKillerValidator {
         )
         .await
         .map_err(|e| anyhow::anyhow!("Gas analysis failed: {}", e))?;
+        let phases = AnalysisPhases {
+            extraction: analysis.extraction,
+            executor_cache_hit: analysis.executor_cache_hit,
+            timings: analysis.timings,
+        };
+        // Observed here rather than in either caller so the router and the operators cannot
+        // measure different intervals for the same work.
+        if let Some(metrics) = &self.validator_metrics {
+            metrics
+                .evmsketch_duration_seconds
+                .observe(started.elapsed().as_secs_f64());
+            metrics.observe_analysis(&phases);
+        }
 
         // Every path that produces a signable diff — the router's task creation and each node's
         // independent recomputation — comes through here, so refusing an empty program once keeps
@@ -474,6 +690,7 @@ impl GasKillerValidator {
             storage_updates: analysis.storage_updates.to_vec(),
             gas_estimate: analysis.gas_estimate,
             block_height,
+            phases,
         })
     }
 
@@ -581,7 +798,6 @@ impl GasKillerValidator {
             "Computing storage updates for detected chain"
         );
 
-        let evmsketch_start = Instant::now();
         let result = self
             .analyze_transaction(
                 rpc_url,
@@ -592,10 +808,6 @@ impl GasKillerValidator {
                 task_data.block_height,
             )
             .await?;
-        if let Some(m) = &self.validator_metrics {
-            m.evmsketch_duration_seconds
-                .observe(evmsketch_start.elapsed().as_secs_f64());
-        }
         Ok(result.storage_updates)
     }
 
@@ -621,6 +833,9 @@ impl GasKillerValidator {
         {
             let cache = self.digest_cache.lock().await;
             if let Some(cached) = cache.get(&cache_key) {
+                if let Some(metrics) = &self.validator_metrics {
+                    metrics.observe_digest_cache(true);
+                }
                 debug!(
                     transition_index = task_data.transition_index,
                     block_height = task_data.block_height,
@@ -628,6 +843,10 @@ impl GasKillerValidator {
                 );
                 return Ok(*cached);
             }
+        }
+
+        if let Some(metrics) = &self.validator_metrics {
+            metrics.observe_digest_cache(false);
         }
 
         // Not cached — compute storage updates (the expensive EVMSketch path)
@@ -658,6 +877,7 @@ impl commonware_avs_core::validator::ValidatorTrait<GasKillerTaskData> for GasKi
 mod tests {
     use super::*;
     use alloy::primitives::{Address, U256};
+    use std::time::Duration;
 
     fn create_test_task_data() -> GasKillerTaskData {
         GasKillerTaskData {
@@ -804,5 +1024,94 @@ mod tests {
         let hash2 = task_data.build_payload_hash(&[0x03, 0x04]);
 
         assert_ne!(hash1, hash2);
+    }
+
+    fn phases(extraction: Extraction, executor_cache_hit: bool) -> AnalysisPhases {
+        AnalysisPhases {
+            extraction,
+            executor_cache_hit,
+            timings: EncodePhaseTimings {
+                trace_fetch: Duration::from_millis(1500),
+                parse: Duration::from_millis(300),
+                executor_build: Duration::from_millis(80),
+                prefetch: Duration::from_millis(40),
+                revm_estimate: Duration::from_millis(60),
+            },
+        }
+    }
+
+    #[test]
+    fn the_struct_log_path_reports_every_phase_under_its_extraction_label() {
+        let metrics = ValidatorMetrics::new();
+        metrics.observe_analysis(&phases(Extraction::StructLog, false));
+
+        let output = metrics.encode();
+        for phase in [
+            "trace_fetch",
+            "parse",
+            "executor_build",
+            "state_prefetch",
+            "revm_estimate",
+        ] {
+            assert!(
+                output.contains(&format!(
+                    "gas_killer_evmsketch_{phase}_seconds_count{{extraction=\"struct_log\"}} 1"
+                )),
+                "{phase} must be observed on the struct-log path"
+            );
+        }
+        assert!(output.contains("gas_killer_evmsketch_executor_cache_total{result=\"miss\"} 1"));
+    }
+
+    /// The net form fetches no struct-log trace, so it must leave the parse series untouched
+    /// rather than observing a zero. An invented zero would drag the parse percentiles down and
+    /// hide exactly the saving this label exists to measure.
+    #[test]
+    fn the_net_form_leaves_the_parse_series_empty() {
+        let metrics = ValidatorMetrics::new();
+        metrics.observe_analysis(&phases(Extraction::PrestateNet, true));
+
+        let output = metrics.encode();
+        assert!(
+            output.contains(
+                "gas_killer_evmsketch_trace_fetch_seconds_count{extraction=\"prestate_net\"} 1"
+            ),
+            "the net form still reads two tracers"
+        );
+        assert!(
+            !output
+                .contains("gas_killer_evmsketch_parse_seconds_count{extraction=\"prestate_net\"}"),
+            "no parse series may exist for a path that never parses"
+        );
+        assert!(output.contains("gas_killer_evmsketch_executor_cache_total{result=\"hit\"} 1"));
+    }
+
+    /// A fallback pays for both paths, so it must report a parse cost — under its own label, so
+    /// it never masquerades as a cheap net-form run.
+    #[test]
+    fn a_prestate_fallback_reports_a_parse_cost_under_its_own_label() {
+        let metrics = ValidatorMetrics::new();
+        metrics.observe_analysis(&phases(Extraction::PrestateFallback, false));
+
+        let output = metrics.encode();
+        assert!(output.contains(
+            "gas_killer_evmsketch_parse_seconds_count{extraction=\"prestate_fallback\"} 1"
+        ));
+        assert!(
+            !output.contains("extraction=\"prestate_net\""),
+            "a fallback is not a net-form run"
+        );
+    }
+
+    #[test]
+    fn digest_cache_outcomes_are_counted_separately() {
+        let metrics = ValidatorMetrics::new();
+        metrics.observe_digest_cache(true);
+        metrics.observe_digest_cache(true);
+        metrics.observe_digest_cache(false);
+
+        let output = metrics.encode();
+        assert!(output.contains("gas_killer_evmsketch_digest_cache_total{result=\"hit\"} 2"));
+        assert!(output.contains("gas_killer_evmsketch_digest_cache_total{result=\"miss\"} 1"));
     }
 }

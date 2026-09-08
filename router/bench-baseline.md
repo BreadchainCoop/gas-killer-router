@@ -85,3 +85,43 @@ count(count by (fingerprint) (gas_killer_config_fingerprint))
 
 | Date | Commit | W | in-flight avg/max | height_age max | skip ratio | directive rate_limited/min | Notes |
 |------|--------|---|-------------------|----------------|------------|----------------------------|-------|
+
+## EVMSketch phases
+
+Where the time inside one gas analysis goes. Capture these before sizing node CPU or a dedicated
+simulation endpoint, because the two classes have different fixes and the total cannot tell them
+apart.
+
+```promql
+# The headline question: which class of phase consumes more wall clock per second of runtime.
+# Taken from the histogram sums, so the two are comparable magnitudes.
+sum(rate(gas_killer_evmsketch_trace_fetch_seconds_sum[10m])) + sum(rate(gas_killer_evmsketch_state_prefetch_seconds_sum[10m]))
+sum(rate(gas_killer_evmsketch_parse_seconds_sum[10m])) + sum(rate(gas_killer_evmsketch_revm_estimate_seconds_sum[10m]))
+
+# Per-phase p95. trace_fetch and executor_build overlap inside the analyzer — never add them.
+histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_trace_fetch_seconds_bucket[10m])))
+histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_parse_seconds_bucket[10m])))
+histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_executor_build_seconds_bucket[10m])))
+histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_state_prefetch_seconds_bucket[10m])))
+histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_revm_estimate_seconds_bucket[10m])))
+
+# prestate-net vs struct-log: mean seconds per run, by extractor. The net form has no parse
+# series at all, which is the saving.
+sum by (extraction) (rate(gas_killer_evmsketch_trace_fetch_seconds_sum[10m])) / sum by (extraction) (rate(gas_killer_evmsketch_trace_fetch_seconds_count[10m]))
+sum by (extraction) (rate(gas_killer_evmsketch_parse_seconds_sum[10m])) / sum by (extraction) (rate(gas_killer_evmsketch_parse_seconds_count[10m]))
+
+# How often each extractor ran. A high prestate_fallback share means the net form is being
+# attempted and wasted.
+sum by (extraction) (rate(gas_killer_evmsketch_trace_fetch_seconds_count[10m])) * 60
+
+# Cache hit ratios; without these the histograms above describe an unknown number of runs.
+sum(rate(gas_killer_evmsketch_executor_cache_total{result="hit"}[10m])) / sum(rate(gas_killer_evmsketch_executor_cache_total[10m]))
+sum(rate(gas_killer_evmsketch_digest_cache_total{result="hit"}[10m])) / sum(rate(gas_killer_evmsketch_digest_cache_total[10m]))
+
+# The same analysis on both sides: the router pays it serially on the assignment path.
+histogram_quantile(0.95, sum by (le) (rate(gas_killer_node_evmsketch_duration_seconds_bucket{job=~".*router.*"}[10m])))
+histogram_quantile(0.95, sum by (le) (rate(gas_killer_node_evmsketch_duration_seconds_bucket{job=~".*node.*"}[10m])))
+```
+
+| Date | Commit | STATE_ENCODING | extraction mix | trace_fetch p95 | parse p95 | revm_estimate p95 | RPC vs CPU (s/s) | executor hit % | Notes |
+|------|--------|----------------|----------------|-----------------|-----------|-------------------|------------------|----------------|-------|

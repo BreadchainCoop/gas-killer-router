@@ -267,6 +267,12 @@ impl GasKillerTaskSource {
                 .map_err(|e| anyhow::anyhow!("Failed to compute storage updates: {}", e))?;
             (updates, height, chain_id, idx, start.elapsed())
         } else {
+            // Timed from here, before chain detection, so both branches report the same span:
+            // everything the sequencer does to turn a request into storage updates. The
+            // explicit-index branch detects the chain inside
+            // `compute_storage_updates_for_tx`, so starting the clock after detection here
+            // would report a shorter interval for the same work.
+            let start = Instant::now();
             // Detect chain once so all concurrent futures skip redundant eth_getCode probes.
             let chain_role = self
                 .validator
@@ -294,7 +300,6 @@ impl GasKillerTaskSource {
                     .await
             };
             let storage_fut = async {
-                let start = Instant::now();
                 self.validator
                     .analyze_transaction(
                         &rpc_url,
@@ -305,11 +310,11 @@ impl GasKillerTaskSource {
                         task.body.block_height,
                     )
                     .await
-                    .map(|r| (r.storage_updates, r.block_height, start.elapsed()))
+                    .map(|r| (r.storage_updates, r.block_height))
             };
             // eth_chainId runs concurrently — completes in ~50ms, well before EVMSketch.
             let chain_id_fut = async move { chain_id_validator.get_chain_id_for(chain_role).await };
-            let (count, (updates, height, storage_elapsed), chain_id) =
+            let (count, (updates, height), chain_id) =
                 tokio::try_join!(count_fut, storage_fut, chain_id_fut)?;
 
             info!(
@@ -318,7 +323,7 @@ impl GasKillerTaskSource {
                 count,
                 "Resolved auto transition_index from chain"
             );
-            (updates, height, chain_id, count, storage_elapsed)
+            (updates, height, chain_id, count, start.elapsed())
         };
 
         if let Some(m) = &self.metrics {
