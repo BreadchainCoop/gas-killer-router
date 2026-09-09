@@ -716,6 +716,10 @@ sharedData:
   storageClass: ""
   size: 1Gi
   accessMode: ReadWriteOnce
+  # Keep the claim on `helm uninstall`. This volume holds the operator keys, which cannot be
+  # regenerated once their addresses are registered on chain. The cost is that removing or
+  # resizing it needs an explicit `kubectl delete pvc`; set false for throwaway clusters.
+  retainOnUninstall: true
 
 # =============================================================================
 # Log aggregation — Loki + Alloy

@@ -94,11 +94,16 @@ spec:
               echo "Secret found and no existing restore target files were detected. Restoring state from Secret Manager..."
               mkdir -p /root/.nodes/operator_keys
 
+              # Every secret this run restores, as "<secret> <path>", checked against the
+              # key-export job's manifest before the completion marker is written.
+              RESTORED=$(mktemp)
+
               # Restore avs_deploy.json
               gcloud secrets versions access latest \
                 --secret="${DEPLOY_SECRET}" \
                 --project="${PROJECT}" \
                 > /root/.nodes/avs_deploy.json
+              printf "%s %s\n" "${DEPLOY_SECRET}" /root/.nodes/avs_deploy.json >> "$RESTORED"
               echo "Restored avs_deploy.json"
 
               # Restore each operator's BLS key — fails fast if any secret is missing.
@@ -109,6 +114,8 @@ spec:
                 --secret="${PREFIX}-node-{{ $nodeIndex }}-bls-key" \
                 --project="${PROJECT}" \
                 > /root/.nodes/operator_keys/testacc{{ $nodeIndex }}.private.bls.key.json
+              printf "%s %s\n" "${PREFIX}-node-{{ $nodeIndex }}-bls-key" \
+                /root/.nodes/operator_keys/testacc{{ $nodeIndex }}.private.bls.key.json >> "$RESTORED"
               echo "Restored testacc{{ $nodeIndex }} BLS key"
               {{- end }}
 
@@ -123,6 +130,7 @@ spec:
                 if gcloud secrets versions access latest \
                     --secret="$secret" --project="${PROJECT}" > "${dest}.tmp" 2>/dev/null; then
                   mv "${dest}.tmp" "$dest"
+                  printf "%s %s\n" "$secret" "$dest" >> "$RESTORED"
                   echo "Restored testacc${index} secp256k1 key"
                   return 0
                 fi
@@ -149,6 +157,62 @@ spec:
                 || echo "No ${PREFIX}-node-{{ $nodeIndex }}-ecdsa-key secret; skipping (unused under bls)"
               {{- end }}
               {{- end }}
+
+              # Check the restore against the key-export job's manifest before the completion
+              # marker is written. The marker tells eigenlayer-setup the volume is populated, so
+              # writing it over an incomplete restore is what turns lost keys into permanent loss.
+              MANIFEST=$(mktemp)
+              MANIFEST_SECRET="${PREFIX}-key-manifest"
+              trap 'rm -f "$MANIFEST" "$RESTORED"' EXIT
+
+              # Fails if any manifest row this job owns was not reproduced by the restore. setup
+              # and generate-router-key run concurrently, so each checks only its own rows; an
+              # empty owner predates the column and belongs to setup.
+              check_manifest() {
+                local unaccounted=0 checked=0 secret want owner path got
+                while read -r secret want owner; do
+                  [ -n "$secret" ] || continue
+                  case "${owner:-setup}" in setup) ;; *) continue ;; esac
+                  checked=$((checked + 1))
+                  # `|| true`: grep exits 1 for a secret that was never restored, which is the
+                  # case being reported, and `set -e` would abort before the message.
+                  path=$(grep "^${secret} " "$RESTORED" | head -1 | cut -d" " -f2- || true)
+                  if [ -z "$path" ] || [ ! -f "$path" ]; then
+                    echo "ERROR: manifest lists ${secret} but this restore did not write it" >&2
+                    unaccounted=$((unaccounted + 1))
+                    continue
+                  fi
+                  got=$(sha256sum "$path" | cut -d" " -f1)
+                  if [ "$want" != "$got" ]; then
+                    echo "ERROR: ${secret} restored to ${path} as ${got}, manifest says ${want}" >&2
+                    unaccounted=$((unaccounted + 1))
+                  fi
+                done < "$MANIFEST"
+                [ "$unaccounted" -eq 0 ] || return 1
+                echo "Restore matches the key manifest (${checked} entries owned by setup)."
+              }
+
+              # Only NOT_FOUND means "no manifest": a permission or network error must not fall
+              # through to the unverified path, or a transient failure licenses the partial
+              # restore this exists to catch. `2>&1 >file` captures stderr, stdout goes to the file.
+              if manifest_error="$(gcloud secrets versions access latest \
+                  --secret="${MANIFEST_SECRET}" --project="${PROJECT}" 2>&1 >"$MANIFEST")"; then
+                if ! check_manifest; then
+                  echo "Refusing to mark setup complete; the marker would make this loss permanent." >&2
+                  echo "Recovery: fix the ${PREFIX}-* secrets in project ${PROJECT}, then delete" >&2
+                  echo "avs_deploy.json and operator_keys/ from the volume before retrying." >&2
+                  exit 1
+                fi
+              elif printf '%s\n' "${manifest_error}" | grep -Eqi '(^|[[:space:][:punct:]])NOT_FOUND([[:space:][:punct:]]|$)|not found'; then
+                # A deployment whose last export predates the manifest has none. Restoring is
+                # still correct; it just cannot be checked for completeness.
+                echo "WARNING: no ${MANIFEST_SECRET} secret; cannot verify this restore is complete." >&2
+                echo "WARNING: re-run the key-export job to record one." >&2
+              else
+                echo "ERROR: could not read ${MANIFEST_SECRET}: ${manifest_error}" >&2
+                echo "Refusing to mark setup complete without verifying the restore." >&2
+                exit 1
+              fi
 
               # Fix permissions so non-root containers can read the files
               chmod -R 755 /root/.nodes

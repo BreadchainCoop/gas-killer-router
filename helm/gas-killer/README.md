@@ -157,6 +157,39 @@ The registry's on-chain threshold comes from `eigenlayer.sdk.quorumThreshold` /
 `eigenlayer.sdk.thresholdDenominator`, which are also rendered into the router as its local
 participation floor, so the off-chain and on-chain checks stay in lockstep.
 
+## Operator key durability
+
+The shared-data volume holds the operators' BLS and secp256k1 key files. The eigenlayer setup
+container generates them once with a live RNG, and until the key-export job copies them to Secret
+Manager they exist nowhere else. A lost operator key cannot be recovered, only replaced, and
+replacing one means re-registering the operator set on chain.
+
+Three independent guards keep that from happening quietly:
+
+- **The claim outlives the release.** `sharedData.retainOnUninstall` (default true) puts
+  `helm.sh/resource-policy: keep` on the PVC, so `helm uninstall` does not take the volume with
+  it. That also makes the PV's reclaim policy moot, which matters because the default GKE
+  StorageClass reclaims on delete.
+- **Backups are read back before they are trusted.** The key-export job re-reads every secret it
+  writes and compares the bytes, then records a manifest secret (`<keyPrefix>-key-manifest`)
+  listing what it backed up, with a sha256 and the job responsible for restoring it. It also
+  reports any key file on the volume it has no rule for.
+- **A partial restore is never marked complete.** The setup job's restore path verifies what it
+  restored against that manifest before writing `.setup_complete`. Since the marker is what tells
+  the eigenlayer container to skip regeneration, writing it after an incomplete restore is what
+  turns a recoverable gap into a permanent one. On a mismatch the job fails, leaves the marker
+  off, and names the secrets it could not account for.
+
+A deployment whose last export predates the manifest has none; the restore warns loudly and
+proceeds, since refusing would strand a volume that is probably fine. Re-run the key-export job
+to record one. Only a `NOT_FOUND` counts as absent: any other Secret Manager failure fails the
+job rather than falling through to the unverified path.
+
+When the gate fails it leaves the restored files on the volume without the marker, which the
+partial-state guard then refuses to restore over. Recovery is to fix the secrets, then delete
+`avs_deploy.json` and `operator_keys/` from the volume before retrying. The job's error output
+says so.
+
 ## Architecture
 
 The chart deploys the following components:

@@ -2,6 +2,12 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "gas-killer.shareddata.fullname" . }}
+  {{- if .Values.sharedData.retainOnUninstall }}
+  annotations:
+    # Retaining the claim also makes the PV reclaim policy moot: it is never released, so
+    # `Delete` never fires. See sharedData.retainOnUninstall.
+    "helm.sh/resource-policy": keep
+  {{- end }}
   labels:
     {{- include "gas-killer.labels" . | nindent 4 }}
 spec:
