@@ -142,7 +142,7 @@ impl ValidatorMetrics {
             Histogram::new([0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, 120.0]);
         registry.register(
             "gas_killer_node_evmsketch_duration_seconds",
-            "Duration of gas analysis (EVMSketch + RPC calls), cache-miss path only. Excludes chain detection.",
+            "Duration of gas analysis (EVMSketch + RPC calls), cache-miss path only. Excludes chain detection. Emitted by the router and the operators alike; the `node` in the name is historical, and the two are separated by the scrape target.",
             evmsketch_duration_seconds.clone(),
         );
 

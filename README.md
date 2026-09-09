@@ -290,7 +290,7 @@ separated by the scrape target:
 | `gas_killer_evmsketch_revm_estimate_seconds{extraction}` | Pricing the payload under revm: local CPU |
 | `gas_killer_evmsketch_executor_cache_total{result}` | Executor-cache hit/miss — the speculative pre-build's scorecard |
 | `gas_killer_evmsketch_digest_cache_total{result}` | Digest-cache hit/miss; a hit skips the whole analysis |
-| `gas_killer_node_evmsketch_duration_seconds` | The whole analysis call, cache-miss path only |
+| `gas_killer_node_evmsketch_duration_seconds` | The whole analysis call, cache-miss path only. The `node` in the name is historical: both the router and the operators emit it, distinguished by the scrape target |
 | `gas_killer_storage_computation_seconds` | Router only, and broader: chain detection plus the transition-index read plus the analysis |
 
 `extraction` is `prestate_net`, `struct_log`, or `prestate_fallback`. The net form reads two cheap
