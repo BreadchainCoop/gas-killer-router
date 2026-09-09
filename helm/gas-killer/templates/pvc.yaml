@@ -4,13 +4,8 @@ metadata:
   name: {{ include "gas-killer.shareddata.fullname" . }}
   {{- if .Values.sharedData.retainOnUninstall }}
   annotations:
-    # Outlives `helm uninstall`. This volume holds the operator key files, which exist
-    # nowhere else until the key-export job copies them to Secret Manager and cannot be
-    # regenerated, since their addresses are registered on chain. Keeping the claim also
-    # makes the PV's reclaim policy moot: it is never released, so `Delete` never fires.
-    #
-    # The volume then only goes away on an explicit `kubectl delete pvc`, and resizing it
-    # means deleting it first.
+    # Retaining the claim also makes the PV reclaim policy moot: it is never released, so
+    # `Delete` never fires. See sharedData.retainOnUninstall.
     "helm.sh/resource-policy": keep
   {{- end }}
   labels:

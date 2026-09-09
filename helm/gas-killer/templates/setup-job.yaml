@@ -158,67 +158,61 @@ spec:
               {{- end }}
               {{- end }}
 
-              # The marker below tells eigenlayer-setup the volume is populated, so it never
-              # regenerates. Verify the restore against the key-export job's manifest first: an
-              # entry that is missing, or whose bytes differ, means key material that once existed
-              # is gone, and operator keys cannot be regenerated because their addresses are
-              # registered on chain. Failing leaves the marker off, which keeps the volume in the
-              # partial state the guard above refuses to restore over.
-              #
-              # Only NOT_FOUND means "no manifest". A permission or network failure here must not
-              # fall through to the unverified path, or a transient error licenses exactly the
-              # partial restore this checks for. Same classification the avs-deploy probe above
-              # uses: `2>&1 >file` captures stderr while stdout goes to the file.
+              # Check the restore against the key-export job's manifest before the completion
+              # marker is written. The marker tells eigenlayer-setup the volume is populated, so
+              # writing it over an incomplete restore is what turns lost keys into permanent loss.
               MANIFEST=$(mktemp)
               MANIFEST_SECRET="${PREFIX}-key-manifest"
-              if manifest_error="$(gcloud secrets versions access latest \
-                  --secret="${MANIFEST_SECRET}" --project="${PROJECT}" 2>&1 >"$MANIFEST")"; then
-                MISSING=0
-                CHECKED=0
+              trap 'rm -f "$MANIFEST" "$RESTORED"' EXIT
+
+              # Fails if any manifest row this job owns was not reproduced by the restore. setup
+              # and generate-router-key run concurrently, so each checks only its own rows; an
+              # empty owner predates the column and belongs to setup.
+              check_manifest() {
+                local unaccounted=0 checked=0 secret want owner path got
                 while read -r secret want owner; do
                   [ -n "$secret" ] || continue
-                  # Only this job's rows; generate-router-key restores the rest and runs
-                  # concurrently. An empty owner predates the column and belongs to setup.
                   case "${owner:-setup}" in setup) ;; *) continue ;; esac
-                  CHECKED=$((CHECKED + 1))
-                  # `|| true`: grep exits 1 for a secret that was not restored, which is the
-                  # case being reported. Without it `set -e` aborts before the message.
+                  checked=$((checked + 1))
+                  # `|| true`: grep exits 1 for a secret that was never restored, which is the
+                  # case being reported, and `set -e` would abort before the message.
                   path=$(grep "^${secret} " "$RESTORED" | head -1 | cut -d" " -f2- || true)
                   if [ -z "$path" ] || [ ! -f "$path" ]; then
                     echo "ERROR: manifest lists ${secret} but this restore did not write it" >&2
-                    MISSING=$((MISSING + 1))
+                    unaccounted=$((unaccounted + 1))
                     continue
                   fi
                   got=$(sha256sum "$path" | cut -d" " -f1)
                   if [ "$want" != "$got" ]; then
                     echo "ERROR: ${secret} restored to ${path} as ${got}, manifest says ${want}" >&2
-                    MISSING=$((MISSING + 1))
+                    unaccounted=$((unaccounted + 1))
                   fi
                 done < "$MANIFEST"
+                [ "$unaccounted" -eq 0 ] || return 1
+                echo "Restore matches the key manifest (${checked} entries owned by setup)."
+              }
 
-                if [ "$MISSING" -gt 0 ]; then
-                  echo "ERROR: ${MISSING} manifest entr(ies) unaccounted for; refusing to mark setup complete." >&2
-                  echo "Marking it complete would tell eigenlayer-setup to skip, making the loss permanent." >&2
+              # Only NOT_FOUND means "no manifest": a permission or network error must not fall
+              # through to the unverified path, or a transient failure licenses the partial
+              # restore this exists to catch. `2>&1 >file` captures stderr, stdout goes to the file.
+              if manifest_error="$(gcloud secrets versions access latest \
+                  --secret="${MANIFEST_SECRET}" --project="${PROJECT}" 2>&1 >"$MANIFEST")"; then
+                if ! check_manifest; then
+                  echo "Refusing to mark setup complete; the marker would make this loss permanent." >&2
                   echo "Recovery: fix the ${PREFIX}-* secrets in project ${PROJECT}, then delete" >&2
-                  echo "avs_deploy.json and operator_keys/ from the shared volume before retrying." >&2
-                  echo "This run left them in place without the marker, and the partial-state guard" >&2
-                  echo "refuses to restore over that." >&2
-                  rm -f "$MANIFEST" "$RESTORED"
+                  echo "avs_deploy.json and operator_keys/ from the volume before retrying." >&2
                   exit 1
                 fi
-                echo "Restore matches the key manifest (${CHECKED} entries owned by setup)."
               elif printf '%s\n' "${manifest_error}" | grep -Eqi '(^|[[:space:][:punct:]])NOT_FOUND([[:space:][:punct:]]|$)|not found'; then
-                # A deployment whose last export predates the manifest has none, so completeness
-                # cannot be checked. Restoring is still correct.
+                # A deployment whose last export predates the manifest has none. Restoring is
+                # still correct; it just cannot be checked for completeness.
                 echo "WARNING: no ${MANIFEST_SECRET} secret; cannot verify this restore is complete." >&2
                 echo "WARNING: re-run the key-export job to record one." >&2
               else
                 echo "ERROR: could not read ${MANIFEST_SECRET}: ${manifest_error}" >&2
                 echo "Refusing to mark setup complete without verifying the restore." >&2
-                rm -f "$MANIFEST" "$RESTORED"
                 exit 1
               fi
-              rm -f "$MANIFEST" "$RESTORED"
 
               # Fix permissions so non-root containers can read the files
               chmod -R 755 /root/.nodes
