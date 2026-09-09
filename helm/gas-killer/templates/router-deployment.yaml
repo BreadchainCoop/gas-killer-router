@@ -399,7 +399,23 @@ spec:
               value: {{ .Values.router.persistence.mountPath | quote }}
             # Quorum signature scheme (bls | schnorr); must match the nodes'.
             - name: SIGNATURE_SCHEME
-              value: {{ default "bls" .Values.global.signatureScheme | quote }}
+              value: {{ include "gas-killer.signatureScheme" . | quote }}
+            {{- if include "gas-killer.isSchnorr" . }}
+            # The coordinator's participation floor. Same values the schnorr-operators job
+            # fixes into the registry's on-chain threshold, keeping the two in lockstep.
+            - name: QUORUM_THRESHOLD
+              value: {{ .Values.eigenlayer.sdk.quorumThreshold | quote }}
+            - name: THRESHOLD_DENOMINATOR
+              value: {{ .Values.eigenlayer.sdk.thresholdDenominator | quote }}
+            {{- with .Values.schnorr.stageTimeoutSecs }}
+            - name: SCHNORR_STAGE_TIMEOUT_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.schnorr.messagesPerSecond }}
+            - name: P2P_SCHNORR_MESSAGES_PER_SECOND
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             # Storage-update encoding (legacy | canonical | prestate-net); must match
             # the nodes' — it changes the task digest.
             - name: STATE_ENCODING

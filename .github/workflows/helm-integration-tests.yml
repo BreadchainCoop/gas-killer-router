@@ -214,6 +214,29 @@ jobs:
           echo "Setup job completed successfully"
           kubectl logs "$SETUP_JOB" --tail=30
 
+      - name: Wait for schnorr operator-set job to complete
+        if: matrix.signature_scheme == 'schnorr'
+        run: |
+          echo "Waiting for the schnorr operator-set job..."
+
+          SCHNORR_JOB=$(kubectl get jobs -o name | grep schnorr-operators | head -1)
+
+          if [ -z "$SCHNORR_JOB" ]; then
+            echo "schnorr-operators job not found, but global.signatureScheme=schnorr"
+            kubectl get jobs
+            exit 1
+          fi
+
+          echo "Found schnorr job: $SCHNORR_JOB"
+          kubectl wait --for=condition=complete "$SCHNORR_JOB" --timeout=900s || {
+            echo "schnorr-operators job failed or timed out"
+            kubectl logs "$SCHNORR_JOB" --tail=100 || true
+            exit 1
+          }
+
+          echo "Operator set registered"
+          kubectl logs "$SCHNORR_JOB" --tail=30
+
       - name: Wait for bridge job to complete
         run: |
           echo "Waiting for bridge job to complete..."
@@ -502,7 +525,24 @@ jobs:
             MANIFEST_EXAMPLE="arraySummation"
           fi
 
-          # No-op under bls; registers the operator set before any target deploys under schnorr.
+          # The chart's schnorr-operators job already deployed the registry and registered the
+          # operator set in-cluster. Pointing the binary at that address makes this a
+          # verification pass rather than a second deployment: with the address set it checks
+          # the registry has code and submits no registrations. Leaving it unset would deploy a
+          # rival registry and leave the chart's job untested.
+          if [ "$SIGNATURE_SCHEME" = "schnorr" ]; then
+            SCHNORR_STAKE_REGISTRY_ADDRESS=$(jq -r '.addresses.schnorrStakeRegistry // empty' \
+              ./config/.nodes/avs_deploy.json)
+            if [ -z "$SCHNORR_STAKE_REGISTRY_ADDRESS" ]; then
+              echo "schnorrStakeRegistry missing from avs_deploy.json; the chart's schnorr-operators job did not run"
+              kubectl logs -l app.kubernetes.io/component=schnorr-operators --tail 100 || true
+              exit 1
+            fi
+            export SCHNORR_STAKE_REGISTRY_ADDRESS
+            echo "Reusing the registry the chart deployed: $SCHNORR_STAKE_REGISTRY_ADDRESS"
+          fi
+
+          # No-op under bls; verifies the operator set before any target deploys under schnorr.
           ./target/release/setup_schnorr_operators
           ./target/release/deploy_example --example "$MANIFEST_EXAMPLE"
 

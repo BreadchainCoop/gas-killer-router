@@ -117,7 +117,7 @@ spec:
                 export ARRAY_SIZE={{ .Values.playground.arraySize | quote }}
                 export MAX_VALUE={{ .Values.playground.maxValue | quote }}
                 export ARRAY_SEED={{ .Values.playground.arraySeed | quote }}
-                OUT=$(forge script script/ArraySummation.s.sol:ArraySummationScript \
+                OUT=$(forge script script/DeployArraySummation.s.sol:DeployArraySummation \
                   --rpc-url "$HTTP_RPC" --private-key "$PRIVATE_KEY" --broadcast 2>&1) || {
                     echo "$OUT"; echo "ERROR: target deploy failed"; exit 1; }
                 echo "$OUT"

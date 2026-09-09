@@ -27,13 +27,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo fetch
 
-# Build release binary and copy it out of the cache-mounted target dir
+# Build release binary and copy it out of the cache-mounted target dir.
+# setup_schnorr_operators is a `scripts` crate bin rather than a router one, so it takes a
+# second invocation. It ships here because the chart's schnorr-operators job needs to deploy
+# the SchnorrStakeRegistry and register the operator set from inside the cluster, and this is
+# the only published image with access to the workspace. The registry's creation bytecode is
+# embedded in the checked-in ABI artifact, so it needs no Foundry at runtime.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --release -p gas-killer-router && \
+    cargo build --release -p scripts --bin setup_schnorr_operators && \
     cp /app/target/release/gas-killer-router /usr/local/bin/gas-killer-router && \
     cp /app/target/release/generate_key /usr/local/bin/generate_key && \
-    cp /app/target/release/create_api_key /usr/local/bin/create_api_key
+    cp /app/target/release/create_api_key /usr/local/bin/create_api_key && \
+    cp /app/target/release/setup_schnorr_operators /usr/local/bin/setup_schnorr_operators
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -53,6 +60,7 @@ RUN useradd -m -u 1000 -s /bin/bash appuser
 COPY --from=builder /usr/local/bin/gas-killer-router /usr/local/bin/gas-killer-router
 COPY --from=builder /usr/local/bin/generate_key /usr/local/bin/generate_key
 COPY --from=builder /usr/local/bin/create_api_key /usr/local/bin/create_api_key
+COPY --from=builder /usr/local/bin/setup_schnorr_operators /usr/local/bin/setup_schnorr_operators
 
 # Copy configuration files
 COPY config /app/config

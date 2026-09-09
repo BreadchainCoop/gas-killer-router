@@ -193,3 +193,45 @@ Generate router key job name
 {{- define "gas-killer.generate-router-key.fullname" -}}
 {{- printf "%s-generate-router-key" (include "gas-killer.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
+
+{{/*
+Schnorr operator-set job name
+*/}}
+{{- define "gas-killer.schnorr-operators.fullname" -}}
+{{- printf "%s-schnorr-operators" (include "gas-killer.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Whether the deployment runs the aggregate-Schnorr quorum scheme rather than BLS. Every guard
+that gates schnorr-only chart behaviour reads this, so the default and the spelling live in one
+place. Emits the string "true" or "", so it reads as `if (include "gas-killer.isSchnorr" .)`.
+
+Rejects an unrecognized scheme here rather than letting it reach the pods: `signature_scheme()`
+panics on anything but "bls" or "schnorr", so a typo would otherwise install cleanly and then
+crash-loop the whole fleet.
+*/}}
+{{- define "gas-killer.isSchnorr" -}}
+{{- if eq (include "gas-killer.signatureScheme" .) "schnorr" -}}true{{- end }}
+{{- end }}
+
+{{/*
+The quorum signature scheme (SIGNATURE_SCHEME) shared by the router and every node. Both
+deployments render this one helper, so they cannot be given different values. A mixed fleet
+signs with two incompatible schemes and certifies nothing.
+
+Rejects an unrecognized scheme here rather than letting it reach the pods: `signature_scheme()`
+panics on anything but "bls" or "schnorr", so a typo would otherwise install cleanly and then
+crash-loop the whole fleet.
+
+Trimmed and lowercased to match how the binaries parse it, and normalized before it is emitted.
+The chart gates whole jobs and key paths on this value, so a spelling the binaries accept but
+the templates did not would hand a schnorr fleet a bls-shaped deployment.
+*/}}
+{{- define "gas-killer.signatureScheme" -}}
+{{- $scheme := .Values.global.signatureScheme | default "bls" | trim | lower -}}
+{{- if eq $scheme "" -}}{{- $scheme = "bls" -}}{{- end -}}
+{{- if not (has $scheme (list "bls" "schnorr")) -}}
+{{- fail (printf "global.signatureScheme must be \"bls\" or \"schnorr\", got %q" .Values.global.signatureScheme) -}}
+{{- end -}}
+{{- $scheme -}}
+{{- end }}

@@ -36,7 +36,8 @@ spec:
       {{- end }}
       initContainers:
         {{- if and (eq $root.Values.global.environment "TESTNET") $root.Values.secretManager.enabled }}
-        # Fetch BLS key, avs_deploy.json, and the router public key from GCP Secret Manager.
+        # Fetch the node's signing keys, avs_deploy.json, and the router public key from GCP
+        # Secret Manager.
         # Workload Identity provides authentication — no static credentials needed.
         # Retries until the key-export job has populated all secrets.
         - name: fetch-secrets
@@ -70,6 +71,11 @@ spec:
               fetch_secret "${PREFIX}-node-{{ $nodeIndex }}-bls-key" /app/secrets/bls-key.json
               fetch_secret "${PREFIX}-avs-deploy"                    /app/secrets/avs_deploy.json
               fetch_secret "${PREFIX}-router-public-key"             /app/secrets/public_orchestrator.json
+              {{- if include "gas-killer.isSchnorr" $root }}
+              # The Schnorr signing key, fetched here rather than read off the shared PVC so it
+              # survives a volume rebuild the way the BLS key does.
+              fetch_secret "${PREFIX}-node-{{ $nodeIndex }}-ecdsa-key" /app/secrets/ecdsa-key.json
+              {{- end }}
               echo "All node secrets fetched successfully"
           volumeMounts:
             - name: node-secrets
@@ -85,18 +91,25 @@ spec:
             - |
               echo "Waiting for setup to complete (timeout: {{ $root.Values.global.initTimeout }}s)..."
               KEY_FILE="/app/.nodes/operator_keys/testacc{{ $nodeIndex }}.private.bls.key.json"
+              {{- if include "gas-killer.isSchnorr" $root }}
+              # Under schnorr the node also signs with its secp256k1 key and panics without it.
+              SCHNORR_KEY_FILE="/app/.nodes/operator_keys/testacc{{ $nodeIndex }}.private.ecdsa.key.json"
+              {{- else }}
+              # Always satisfied under bls, where the node loads no secp256k1 key.
+              SCHNORR_KEY_FILE="$KEY_FILE"
+              {{- end }}
               TIMEOUT={{ $root.Values.global.initTimeout }}
               ELAPSED=0
-              until [ -f /app/.nodes/.setup_complete ] && [ -f "$KEY_FILE" ]; do
+              until [ -f /app/.nodes/.setup_complete ] && [ -f "$KEY_FILE" ] && [ -f "$SCHNORR_KEY_FILE" ]; do
                 if [ $ELAPSED -ge $TIMEOUT ]; then
                   echo "ERROR: Timeout waiting for setup to complete after ${TIMEOUT}s"
                   exit 1
                 fi
-                echo "Setup not complete, waiting for .setup_complete marker and $KEY_FILE... (${ELAPSED}s elapsed)"
+                echo "Setup not complete, waiting for .setup_complete marker{{ if include "gas-killer.isSchnorr" $root }}, $KEY_FILE and $SCHNORR_KEY_FILE{{ else }} and $KEY_FILE{{ end }}... (${ELAPSED}s elapsed)"
                 sleep 10
                 ELAPSED=$((ELAPSED + 10))
               done
-              echo "Setup complete! Key file found at $KEY_FILE"
+              echo "Setup complete! Key file{{ if include "gas-killer.isSchnorr" $root }}s found at $KEY_FILE and $SCHNORR_KEY_FILE{{ else }} found at $KEY_FILE{{ end }}"
           volumeMounts:
             - name: shared-data
               mountPath: /app/.nodes
@@ -190,11 +203,15 @@ spec:
             {{- else }}
             {{- fail "orchestrator.publicConfig must be set (or secretManager.enabled=true for TESTNET)" }}
             {{- end }}
-            {{- if eq (default "bls" $root.Values.global.signatureScheme) "schnorr" }}
-            # In schnorr mode the node signs with its secp256k1 operator key
-            # (separate from the BLS p2p identity above), read from the shared PVC.
+            {{- if include "gas-killer.isSchnorr" $root }}
+            # The secp256k1 signing key, separate from the BN254 p2p identity above. Same two
+            # sources as --key-file: Secret Manager when in use, the shared PVC otherwise.
             - "--schnorr-key-file"
+            {{- if and (eq $root.Values.global.environment "TESTNET") $root.Values.secretManager.enabled }}
+            - "/app/secrets/ecdsa-key.json"
+            {{- else }}
             - "/app/.nodes/operator_keys/testacc{{ $nodeIndex }}.private.ecdsa.key.json"
+            {{- end }}
             {{- end }}
           env:
             {{- if eq $root.Values.global.environment "TESTNET" }}
@@ -254,7 +271,15 @@ spec:
               value: {{ $root.Values.node.storageDir | quote }}
             # Quorum signature scheme (bls | schnorr); must match the router's.
             - name: SIGNATURE_SCHEME
-              value: {{ default "bls" $root.Values.global.signatureScheme | quote }}
+              value: {{ include "gas-killer.signatureScheme" $root | quote }}
+            {{- if include "gas-killer.isSchnorr" $root }}
+            {{- with $root.Values.schnorr.messagesPerSecond }}
+            # Per-peer rate on the schnorr protocol channel. Both ends register their own quota,
+            # so this must match the router's or one side drops what the other may send.
+            - name: P2P_SCHNORR_MESSAGES_PER_SECOND
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             # Storage-update encoding (legacy | canonical | prestate-net); must match
             # the router's — it changes the task digest.
             - name: STATE_ENCODING

@@ -102,6 +102,60 @@ See `values.yaml` for all available configuration options.
 | `secrets.privateKey` | Deployer private key | `""` |
 | `secrets.fundedKey` | Funded account private key | `""` |
 | `secrets.adminKey` | Shared secret guarding the `/admin/keys` endpoints, used to mint and revoke per-client API keys via `Authorization: Bearer <value>`. Clients then authenticate `POST /tasks` with their minted key. **Required** when `global.environment=TESTNET` and `router.ingress.enabled=true`. | `""` |
+| `global.signatureScheme` | Quorum signature scheme (`bls` or `schnorr`), shared by the router and every node. See "Schnorr signatures" below: switching is a reinstall, not a rolling change. | `bls` |
+
+## Schnorr signatures
+
+`global.signatureScheme=schnorr` replaces the aggregation engine's BLS certificates with a
+two-round MuSig2 coordinator on p2p channel 2, producing one constant-gas aggregate signature
+verified against a `SchnorrStakeRegistry` rather than a `BLSSignatureChecker`.
+
+Setting it changes three things about the deployment:
+
+- **Each node loads a second key.** Its secp256k1 operator key becomes the Schnorr signing key,
+  separate from the BN254 identity the p2p transport uses in both modes. The eigenlayer setup
+  container writes these next to the BLS keys; with `secretManager.enabled` they are exported to
+  and restored from Secret Manager as `<keyPrefix>-node-<n>-ecdsa-key`.
+- **An extra install-time job runs.** `schnorr-operators` deploys the registry and registers every
+  operator against it with a proof of possession, then records the address under
+  `addresses.schnorrStakeRegistry` in `avs_deploy.json`. It runs between `setup` and
+  `deploy-target`, and `deploy-target` blocks on its marker.
+- **Targets change type.** A Schnorr fleet settles only against `SchnorrGasKillerSDK` consumers
+  wired to that registry. `deploy-target` deploys `SchnorrArraySummation` in place of
+  `ArraySummation`.
+
+### Ordering is load-bearing
+
+Every registration advances the registry's `effectiveBlock` watermark, and verification
+fail-closes for reference blocks behind it. The whole operator set must therefore be registered
+before any target deploys, which is what the marker between the two jobs enforces. A target
+deployed early is not repairable: its registry is immutable.
+
+### Switching an existing deployment
+
+There is no rolling path from `bls` to `schnorr`. A mixed fleet certifies nothing, and every
+target already deployed verifies the other scheme's proof, so it is stranded rather than
+degraded. Switching means reinstalling the operator set and redeploying every target, including
+any an integrator owns. Prove the change on a separate release first.
+
+The one-way door is the registry. `rerun.schnorrOperators=true` without
+`schnorr.stakeRegistryAddress` deploys a *fresh* registry and re-registers everyone, which
+orphans every target wired to the previous one. The job is otherwise install-only and skips when
+`avs_deploy.json` already records an address.
+
+### Values
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `schnorr.deployerSecretKey` | Secret key holding the funded key that deploys the registry and submits the registrations. The deployer becomes the registry owner. | `PRIVATE_KEY` |
+| `schnorr.noticeWindow` | Blocks an operator-set change must be announced ahead of taking effect. `0` applies changes immediately, correct here because the set is registered before any target deploys. | `0` |
+| `schnorr.stakeRegistryAddress` | Reuse an existing registry instead of deploying one. Its operator set is assumed complete, so no registrations are submitted. | `""` |
+| `schnorr.stageTimeoutSecs` | Per-stage timeout for the coordinator's rounds. Empty uses `min(5, ROUND_TIMEOUT/6)`. | `""` |
+| `schnorr.messagesPerSecond` | Per-peer rate on the schnorr channel, rendered into both the router and the nodes. The p2p sender silently drops over-rate messages, and a dropped round message costs a whole retry. Empty uses `64`. | `""` |
+
+The registry's on-chain threshold comes from `eigenlayer.sdk.quorumThreshold` /
+`eigenlayer.sdk.thresholdDenominator`, which are also rendered into the router as its local
+participation floor, so the off-chain and on-chain checks stay in lockstep.
 
 ## Architecture
 
@@ -122,6 +176,9 @@ Components start in a specific order enforced by init containers:
 3. Signer waits for setup completion (needs operator keys)
 4. Nodes wait for setup completion and Ethereum availability
 5. Router waits for setup, Ethereum, and all nodes
+
+Under `global.signatureScheme=schnorr` the schnorr-operators job also waits for setup, and the
+deploy-target job waits for both. See "Schnorr signatures" above.
 
 ## HTTPS / TLS Ingress
 

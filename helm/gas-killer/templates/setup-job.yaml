@@ -112,6 +112,44 @@ spec:
               echo "Restored testacc{{ $nodeIndex }} BLS key"
               {{- end }}
 
+              # Restore each operator's secp256k1 key. Written to a temporary file first: the
+              # redirect creates its target before gcloud runs, so a failed access would leave
+              # an empty file that reads as a present but invalid key.
+              restore_ecdsa_key() {
+                local index="$1"
+                local secret="${PREFIX}-node-${index}-ecdsa-key"
+                local dest="/root/.nodes/operator_keys/testacc${index}.private.ecdsa.key.json"
+
+                if gcloud secrets versions access latest \
+                    --secret="$secret" --project="${PROJECT}" > "${dest}.tmp" 2>/dev/null; then
+                  mv "${dest}.tmp" "$dest"
+                  echo "Restored testacc${index} secp256k1 key"
+                  return 0
+                fi
+
+                rm -f "${dest}.tmp"
+                return 1
+              }
+
+              {{- if include "gas-killer.isSchnorr" $ }}
+              # Fatal under schnorr: the node reads this file at startup and panics without it.
+              {{- range $i := until $nodeCount }}
+              {{- $nodeIndex := add $i 1 }}
+              if ! restore_ecdsa_key {{ $nodeIndex }}; then
+                echo "ERROR: ${PREFIX}-node-{{ $nodeIndex }}-ecdsa-key is missing and global.signatureScheme=schnorr requires it." >&2
+                echo "The eigenlayer setup container writes these keys next to the BLS ones; a deployment whose PVC was rebuilt before they were exported has to re-run setup and re-register the operator set." >&2
+                exit 1
+              fi
+              {{- end }}
+              {{- else }}
+              # Tolerated under bls, where nothing reads them.
+              {{- range $i := until $nodeCount }}
+              {{- $nodeIndex := add $i 1 }}
+              restore_ecdsa_key {{ $nodeIndex }} \
+                || echo "No ${PREFIX}-node-{{ $nodeIndex }}-ecdsa-key secret; skipping (unused under bls)"
+              {{- end }}
+              {{- end }}
+
               # Fix permissions so non-root containers can read the files
               chmod -R 755 /root/.nodes
               chmod 644 /root/.nodes/avs_deploy.json

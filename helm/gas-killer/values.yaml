@@ -20,10 +20,20 @@ global:
   #          AVS contracts are deployed to real L1
   environment: LOCAL
 
-  # Quorum signature scheme: "bls" (default) or "schnorr". Every binary in the
-  # deployment must agree. In schnorr mode the nodes additionally load their
-  # secp256k1 Schnorr key from the operator_keys directory on the shared PVC; keep
-  # this "bls" for TESTNET/secretManager deployments (which restore only BLS keys).
+  # Quorum signature scheme: "bls" (default) or "schnorr". Every binary in the deployment must
+  # agree, so the chart renders one value into both the router and the nodes. An unrecognized
+  # value fails the template rather than reaching the pods, which panic on it.
+  #
+  # "schnorr" replaces the aggregation engine's BLS certificates with a two-round MuSig2
+  # coordinator on p2p channel 2, producing one constant-gas signature verified against a
+  # SchnorrStakeRegistry. It changes three things:
+  #   - each node also loads a secp256k1 signing key, separate from its BN254 p2p identity;
+  #   - the schnorr-operators job deploys the registry and registers the operator set on install,
+  #     before any target deploys (see the `schnorr` block below);
+  #   - targets must be SchnorrGasKillerSDK consumers wired to that registry.
+  #
+  # Switching an existing deployment strands every BLS target already deployed against it, so it
+  # is a reinstall of the operator set and a redeploy of every target, not a rolling change.
   signatureScheme: "bls"
 
   # Storage-update encoding: "legacy" (default), "canonical", or "prestate-net".
@@ -138,6 +148,12 @@ rerun:
   # reader may be part-way through advancing. The job is otherwise install-only, and skips any
   # contract it already recorded that still has code on chain.
   playground: false
+  # Re-run the schnorr operator-set job (global.signatureScheme=schnorr only). Only set this
+  # deliberately: without schnorr.stakeRegistryAddress the job deploys a FRESH
+  # SchnorrStakeRegistry and re-registers every operator, which orphans every target already
+  # wired to the old one. The job is otherwise install-only, and skips when avs_deploy.json
+  # already records a registry address.
+  schnorrOperators: false
   # Re-run the generate-router-key job (TESTNET+secretManager only).
   # Only set this if you intentionally want to rotate the router BLS keypair —
   # doing so requires all nodes to restart and pick up the new public key from GCP.
@@ -578,6 +594,45 @@ bridge:
 # Deploy-target job: deploys a demo GasKillerSDK target (ArraySummation) wired to a real
 # BLSSignatureChecker against the freshly-deployed AVS, then publishes its address to a
 # ConfigMap for the local smoke test. Opt-in (off by default; enable on testnet).
+# Aggregate-Schnorr settings. Every field here is inert under global.signatureScheme=bls.
+# The registry and the operator-set registration come from the schnorr-operators job, which runs
+# on install between setup and deploy-target.
+schnorr:
+  # Secret key (in the app secret) holding the funded key that deploys the registry and submits
+  # the registrations: PRIVATE_KEY or FUNDED_KEY. The deployer becomes the registry's owner.
+  deployerSecretKey: PRIVATE_KEY
+
+  # Blocks a registry operator-set change must be announced ahead of taking effect. The router
+  # ends a rendered payload's validity before the horizon this publishes, so a settlement is
+  # never assembled against one operator set and verified against another.
+  #
+  # 0 applies changes as soon as they are committed, correct here because the whole operator set
+  # is registered before any target deploys. A deployment that mutates its set while rounds are
+  # in flight must exceed the round duration plus eigenlayer.sdk.blockStaleMeasure.
+  noticeWindow: 0
+
+  # Reuse an already-populated SchnorrStakeRegistry instead of deploying a fresh one. Its
+  # operator set is assumed complete, so the job submits no registrations. Leave empty to deploy.
+  stakeRegistryAddress: ""
+
+  # Per-stage timeout (nonce collection, partial collection) for the coordinator's rounds, in
+  # seconds. Empty uses the binary's default of min(5, ROUND_TIMEOUT/6), so several attempts fit
+  # inside one round-timeout window.
+  stageTimeoutSecs: ""
+
+  # Per-peer message rate for the schnorr protocol channel. Empty uses the binary's default of
+  # 64. Size it generously: the p2p sender SILENTLY DROPS messages beyond the rate, and a dropped
+  # signing-round message costs a whole retry attempt.
+  messagesPerSecond: ""
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "250m"
+
 deployTarget:
   enabled: false
   image:

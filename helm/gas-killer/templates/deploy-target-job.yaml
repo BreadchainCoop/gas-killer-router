@@ -2,6 +2,10 @@
 Deploy-target job: deploys a demo GasKillerSDK target (ArraySummation) against the
 freshly-deployed AVS and publishes its address to a ConfigMap for the local smoke test.
 Runs after setup; opt-in via deployTarget.enabled.
+
+Under global.signatureScheme=schnorr it deploys SchnorrArraySummation instead, wired to the
+registry the schnorr-operators job created. The two targets are not interchangeable: a target
+verifies one scheme's proof, so the demo target has to match the fleet's.
 */ -}}
 {{- if and .Values.deployTarget.enabled (or .Release.IsInstall .Values.rerun.deployTarget) }}
 apiVersion: batch/v1
@@ -48,6 +52,22 @@ spec:
                 sleep 10; ELAPSED=$((ELAPSED + 10))
               done
               echo "Setup complete! avs_deploy.json found."
+              {{- if include "gas-killer.isSchnorr" . }}
+
+              # The registry fail-closes for reference blocks behind its effectiveBlock
+              # watermark, so a target deployed before every operator is registered can
+              # never settle.
+              echo "Waiting for the schnorr operator set (timeout: {{ .Values.global.initTimeout }}s)..."
+              ELAPSED=0
+              until [ -f /app/.nodes/.schnorr_operators_complete ]; do
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "ERROR: Timeout waiting for the schnorr operator set after ${TIMEOUT}s"; exit 1
+                fi
+                echo "Waiting for .schnorr_operators_complete... (${ELAPSED}s elapsed)"
+                sleep 10; ELAPSED=$((ELAPSED + 10))
+              done
+              echo "Schnorr operator set registered."
+              {{- end }}
           volumeMounts:
             - name: shared-data
               mountPath: /app/.nodes
@@ -72,14 +92,27 @@ spec:
               export MAX_VALUE={{ .Values.deployTarget.maxValue | quote }}
               export ARRAY_SEED={{ .Values.deployTarget.arraySeed | quote }}
 
+              {{- if include "gas-killer.isSchnorr" . }}
+              export SCHNORR_STAKE_REGISTRY_ADDRESS=$(jq -r '.addresses.schnorrStakeRegistry // empty' "$AVS_JSON")
+
+              echo "[deploy-target] REGISTRY=$SCHNORR_STAKE_REGISTRY_ADDRESS AVS=$AVS_ADDRESS"
+              if [ -z "$SCHNORR_STAKE_REGISTRY_ADDRESS" ]; then
+                echo "ERROR: schnorrStakeRegistry not found in $AVS_JSON"; jq '.addresses' "$AVS_JSON"; exit 1
+              fi
+
+              SCRIPT=script/DeploySchnorrArraySummation.s.sol:DeploySchnorrArraySummation
+              {{- else }}
               echo "[deploy-target] RC=$REGISTRY_COORDINATOR_ADDRESS AVS=$AVS_ADDRESS"
               if [ -z "$REGISTRY_COORDINATOR_ADDRESS" ] || [ "$REGISTRY_COORDINATOR_ADDRESS" = "null" ]; then
                 echo "ERROR: registryCoordinator not found in $AVS_JSON"; jq '.addresses' "$AVS_JSON"; exit 1
               fi
 
               # SIG_CHECKER_ADDRESS intentionally unset -> the script provisions one from REGISTRY_COORDINATOR_ADDRESS.
+              SCRIPT=script/DeployArraySummation.s.sol:DeployArraySummation
+              {{- end }}
+
               set +e
-              OUT=$(forge script script/ArraySummation.s.sol:ArraySummationScript \
+              OUT=$(forge script "$SCRIPT" \
                 --rpc-url "$HTTP_RPC" --private-key "$PRIVATE_KEY" --broadcast 2>&1)
               CODE=$?
               set -e

@@ -1,0 +1,165 @@
+{{- /*
+Schnorr operator-set job: deploys the SchnorrStakeRegistry and registers every operator's
+secp256k1 key against it with a proof of possession, then records the registry address under
+`addresses.schnorrStakeRegistry` in avs_deploy.json.
+
+Renders only under global.signatureScheme=schnorr; the BLS stack verifies against a
+BLSSignatureChecker from the EigenLayer deployment and needs none of this.
+
+Ordering is load-bearing. Every registration advances the registry's effectiveBlock watermark
+and verification fail-closes for reference blocks behind it, so the whole operator set must be
+registered before any target contract deploys. The deploy-target job waits on the marker this
+job writes.
+*/ -}}
+{{- if include "gas-killer.isSchnorr" . }}
+{{- if or .Release.IsInstall .Values.rerun.schnorrOperators }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gas-killer.schnorr-operators.fullname" . }}
+  labels:
+    {{- include "gas-killer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: schnorr-operators
+  annotations:
+    # Runs automatically on helm install. On helm upgrade, only fires when
+    # rerun.schnorrOperators=true.
+    "helm.sh/resource-policy": keep
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "gas-killer.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: schnorr-operators
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Wait for setup: the registry constructor needs the AVS address from avs_deploy.json,
+        # and every registration needs an operator's secp256k1 key.
+        - name: wait-for-setup
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for setup to complete (timeout: {{ .Values.global.initTimeout }}s)..."
+              TIMEOUT={{ .Values.global.initTimeout }}
+              ELAPSED=0
+              until [ -f /app/.nodes/.setup_complete ] && [ -f /app/.nodes/avs_deploy.json ]; do
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "ERROR: Timeout waiting for setup after ${TIMEOUT}s"; exit 1
+                fi
+                echo "Setup not complete, waiting for .setup_complete + avs_deploy.json... (${ELAPSED}s elapsed)"
+                sleep 10; ELAPSED=$((ELAPSED + 10))
+              done
+
+              # The operators' Schnorr keys ARE their secp256k1 keys. Checked here so a volume
+              # missing them fails with the reason rather than inside the registration loop.
+              {{- $nodeCount := int .Values.global.nodeCount }}
+              {{- range $i := until $nodeCount }}
+              {{- $nodeIndex := add $i 1 }}
+              if [ ! -f /app/.nodes/operator_keys/testacc{{ $nodeIndex }}.private.ecdsa.key.json ]; then
+                echo "ERROR: testacc{{ $nodeIndex }}.private.ecdsa.key.json is not on the shared volume."
+                echo "The eigenlayer setup container writes these next to the BLS keys. A volume rebuilt"
+                echo "before they were exported to Secret Manager cannot be registered; re-run setup."
+                exit 1
+              fi
+              {{- end }}
+              echo "Setup complete and all {{ .Values.global.nodeCount }} operator keys present."
+          volumeMounts:
+            - name: shared-data
+              mountPath: /app/.nodes
+              readOnly: true
+
+      containers:
+        - name: setup-schnorr-operators
+          image: "{{ .Values.router.image.repository }}:{{ required "router.image.tag must be set" .Values.router.image.tag }}"
+          imagePullPolicy: {{ .Values.router.image.pullPolicy }}
+          # The binary records the registry address back into avs_deploy.json, which the setup
+          # job left owned by root. The router image otherwise runs as appuser (UID 1000).
+          securityContext:
+            runAsUser: 0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              AVS_JSON=/app/.nodes/avs_deploy.json
+              MARKER=/app/.nodes/.schnorr_operators_complete
+
+              # Without SCHNORR_STAKE_REGISTRY_ADDRESS a second run deploys a FRESH registry and
+              # re-registers everyone, orphaning every target wired to the old one. Recording the
+              # address is the binary's last step, so its presence means the phase succeeded.
+              EXISTING=$(grep -o '"schnorrStakeRegistry"[[:space:]]*:[[:space:]]*"0x[0-9a-fA-F]*"' "$AVS_JSON" \
+                | head -1 | grep -o '0x[0-9a-fA-F]*' || true)
+              if [ -n "$EXISTING" ]; then
+                echo "[schnorr-operators] avs_deploy.json already records schnorrStakeRegistry=$EXISTING; skipping"
+                touch "$MARKER"; chmod 644 "$MARKER"
+                exit 0
+              fi
+
+              echo "[schnorr-operators] deploying SchnorrStakeRegistry and registering the operator set"
+              setup_schnorr_operators
+
+              # Re-read rather than trust the exit code: the marker gates the deploy-target job.
+              if ! grep -q '"schnorrStakeRegistry"' "$AVS_JSON"; then
+                echo "ERROR: setup_schnorr_operators finished without recording schnorrStakeRegistry" >&2
+                exit 1
+              fi
+
+              # Keep the deployment JSON readable by the non-root node and router containers,
+              # which the binary's rewrite would otherwise not preserve.
+              chmod 644 "$AVS_JSON"
+              touch "$MARKER"; chmod 644 "$MARKER"
+              echo "[schnorr-operators] operator set ready"
+          env:
+            - name: SIGNATURE_SCHEME
+              value: {{ include "gas-killer.signatureScheme" . | quote }}
+            - name: AVS_DEPLOYMENT_PATH
+              value: "/app/.nodes/avs_deploy.json"
+            - name: HTTP_RPC
+              {{- if eq .Values.global.environment "TESTNET" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gas-killer.secret.fullname" . }}
+                  key: HTTP_RPC
+              {{- else }}
+              value: "http://{{ include "gas-killer.l1.fullname" . }}:{{ .Values.l1.service.port }}"
+              {{- end }}
+            - name: PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gas-killer.secret.fullname" . }}
+                  key: {{ .Values.schnorr.deployerSecretKey | default "PRIVATE_KEY" }}
+            # The registry's on-chain stake threshold, fixed at deployment. Shares its env vars
+            # with the router coordinator's participation floor, so both read eigenlayer.sdk.
+            - name: QUORUM_THRESHOLD
+              value: {{ .Values.eigenlayer.sdk.quorumThreshold | quote }}
+            - name: THRESHOLD_DENOMINATOR
+              value: {{ .Values.eigenlayer.sdk.thresholdDenominator | quote }}
+            - name: SCHNORR_NOTICE_WINDOW
+              value: {{ .Values.schnorr.noticeWindow | quote }}
+            {{- with .Values.schnorr.stakeRegistryAddress }}
+            # Reuse an already-populated registry rather than deploying one. Its operator set is
+            # assumed complete, so no registrations are submitted.
+            - name: SCHNORR_STAKE_REGISTRY_ADDRESS
+              value: {{ . | quote }}
+            {{- end }}
+            - name: RUST_BACKTRACE
+              value: "1"
+          volumeMounts:
+            - name: shared-data
+              mountPath: /app/.nodes
+          resources:
+            {{- toYaml .Values.schnorr.resources | nindent 12 }}
+
+      volumes:
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: {{ include "gas-killer.shareddata.fullname" . }}
+{{- end }}
+{{- end }}
