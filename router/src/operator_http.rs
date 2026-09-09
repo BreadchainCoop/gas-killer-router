@@ -17,7 +17,7 @@ use axum::{
     routing::get,
 };
 use commonware_runtime::Metrics as _;
-use gas_killer_common::ConfigMetrics;
+use gas_killer_common::{ConfigMetrics, ValidatorMetrics};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,6 +32,9 @@ pub struct HealthState {
     /// This process's configuration fingerprint, published identically by the router and every
     /// operator so a split fleet is one query across the deployment.
     pub config_metrics: Arc<ConfigMetrics>,
+    /// Gas-analysis timing for the router's own enrichment, under the same metric names the
+    /// operators publish so the two sides are directly comparable.
+    pub validator_metrics: Arc<ValidatorMetrics>,
 }
 
 /// Liveness probe: `200` whenever the process is running.
@@ -87,7 +90,7 @@ pub async fn readyz_handler(State(state): State<HealthState>) -> StatusCode {
 }
 
 /// Prometheus scrape endpoint: the commonware runtime's metrics, then the router's own, then
-/// this process's configuration fingerprint.
+/// this process's configuration fingerprint, then its gas-analysis timing.
 #[utoipa::path(
     get,
     path = "/metrics",
@@ -95,9 +98,9 @@ pub async fn readyz_handler(State(state): State<HealthState>) -> StatusCode {
     operation_id = "getMetrics",
     summary = "Prometheus metrics",
     description = "Prometheus text exposition of the commonware runtime metrics, then the \
-                   router's own, then this process's configuration fingerprint. Not JSON, and \
-                   not versioned as part of the API: metric names may change with the code that \
-                   emits them.",
+                   router's own, then this process's configuration fingerprint, then its \
+                   gas-analysis timing. Not JSON, and not versioned as part of the API: metric \
+                   names may change with the code that emits them.",
     servers(
         (url = "http://localhost:8081", description = "Operator port (`HEALTHZ_PORT`)")
     ),
@@ -114,6 +117,7 @@ pub async fn metrics_handler(State(state): State<HealthState>) -> impl IntoRespo
     let mut output = state.context.encode();
     output.push_str(&state.metrics.encode());
     output.push_str(&state.config_metrics.encode());
+    output.push_str(&state.validator_metrics.encode());
     (
         [(
             header::CONTENT_TYPE,

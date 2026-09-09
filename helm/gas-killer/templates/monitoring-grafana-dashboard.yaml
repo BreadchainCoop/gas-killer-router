@@ -311,16 +311,16 @@ data:
         {
           "id": 42,
           "type": "timeseries",
-          "title": "Node EVMSketch Duration (p50 / p99)",
-          "description": "Time for call_to_encoded_state_updates_with_evmsketch on the node (cache-miss path). Scraped from the node's /metrics endpoint.",
+          "title": "Operator EVMSketch Duration (p50 / p99)",
+          "description": "Time for the whole gas-analysis call on the operators, cache-miss path only. The router publishes this metric under the same name for its own enrichment, so this panel filters to the operator jobs; see the EVMSketch Phases section to compare the two sides.",
           "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
           "targets": [
             {
-              "expr": "histogram_quantile(0.50, rate(gas_killer_node_evmsketch_duration_seconds_bucket[5m]))",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(gas_killer_node_evmsketch_duration_seconds_bucket{job=~\".*gas-killer.*node.*\"}[5m])))",
               "legendFormat": "p50"
             },
             {
-              "expr": "histogram_quantile(0.99, rate(gas_killer_node_evmsketch_duration_seconds_bucket[5m]))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(gas_killer_node_evmsketch_duration_seconds_bucket{job=~\".*gas-killer.*node.*\"}[5m])))",
               "legendFormat": "p99"
             }
           ],
@@ -767,6 +767,137 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 90,
+          "type": "text",
+          "title": "EVMSketch Phases",
+          "gridPos": { "x": 0, "y": 109, "w": 24, "h": 1 },
+          "options": { "mode": "markdown", "content": "## EVMSketch Phases\n\nWhere the time inside one gas analysis actually goes, on both the router and the operators. The total alone says a task was slow; these say what to do about it.\n\n**RPC-bound vs CPU-bound** is the panel to read first. Both series are seconds of work per second, taken from the histogram `_sum` counters, so they are directly comparable magnitudes rather than percentiles of different things. Trace fetch and state prefetch are network plus *remote* node CPU: the fix is a dedicated simulation endpoint or bounded concurrency. Struct-log parse and revm estimate are local CPU with no yield points: the fix is cores, or moving the work off the async worker threads.\n\n**Extraction paths** decide how much a run costs before any of it runs. `prestate_net` reads two cheap tracers and never fetches or parses a struct-log trace, so its parse series is empty by construction. `struct_log` fetches a trace whose size grows with execution steps and parses every one. `prestate_fallback` attempted the net form, could not represent the call, and paid for both — so a high fallback rate is the case where `prestate-net` costs more than it saves.\n\n**Caches** gate everything above. A digest-cache hit skips the entire analysis, so the phase histograms cannot be read without knowing the hit rate. The executor cache is what the speculative pre-build exists to fill, and a hit removes the executor build entirely." }
+        },
+        {
+          "id": 91,
+          "type": "timeseries",
+          "title": "RPC-bound vs CPU-bound (seconds of work per second)",
+          "description": "Total time each class of phase consumes, per second of wall clock. Whichever series is higher is the constraint for this workload. Taken from the histogram sums rather than quantiles, because the question is where time goes in aggregate, not what one slow run looked like.",
+          "gridPos": { "x": 0, "y": 110, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum(rate(gas_killer_evmsketch_trace_fetch_seconds_sum[5m])) + sum(rate(gas_killer_evmsketch_state_prefetch_seconds_sum[5m]))",
+              "legendFormat": "RPC-bound (trace fetch + state prefetch)"
+            },
+            {
+              "expr": "sum(rate(gas_killer_evmsketch_parse_seconds_sum[5m])) + sum(rate(gas_killer_evmsketch_revm_estimate_seconds_sum[5m]))",
+              "legendFormat": "CPU-bound (struct-log parse + revm estimate)"
+            },
+            {
+              "expr": "sum(rate(gas_killer_evmsketch_executor_build_seconds_sum[5m]))",
+              "legendFormat": "executor build (overlaps trace fetch)"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "id": 92,
+          "type": "timeseries",
+          "title": "Phase p95",
+          "description": "Per-phase p95 across both roles and all extraction paths. Note trace fetch and executor build overlap — they are the two branches of one join inside the analyzer — so they must not be added together.",
+          "gridPos": { "x": 12, "y": 110, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_trace_fetch_seconds_bucket[5m])))",
+              "legendFormat": "trace fetch"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_parse_seconds_bucket[5m])))",
+              "legendFormat": "struct-log parse"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_executor_build_seconds_bucket[5m])))",
+              "legendFormat": "executor build"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_state_prefetch_seconds_bucket[5m])))",
+              "legendFormat": "state prefetch"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_evmsketch_revm_estimate_seconds_bucket[5m])))",
+              "legendFormat": "revm estimate"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "id": 93,
+          "type": "timeseries",
+          "title": "Mean Cost per Run by Extraction Path",
+          "description": "Mean seconds per analysis, split by which extractor ran. This is the direct prestate-net versus struct-log comparison: if the net form's trace fetch is not decisively cheaper than the struct-log fetch plus parse, prestate-net is not worth defaulting to for this workload.",
+          "gridPos": { "x": 0, "y": 118, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (extraction) (rate(gas_killer_evmsketch_trace_fetch_seconds_sum[5m])) / sum by (extraction) (rate(gas_killer_evmsketch_trace_fetch_seconds_count[5m]))",
+              "legendFormat": "trace fetch {{ "{{" }} extraction {{ "}}" }}"
+            },
+            {
+              "expr": "sum by (extraction) (rate(gas_killer_evmsketch_parse_seconds_sum[5m])) / sum by (extraction) (rate(gas_killer_evmsketch_parse_seconds_count[5m]))",
+              "legendFormat": "parse {{ "{{" }} extraction {{ "}}" }}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "id": 94,
+          "type": "timeseries",
+          "title": "Extraction Path Mix / min",
+          "description": "How often each extractor ran. A rising prestate_fallback share means the net form is being attempted and wasted, which is the workload shape where prestate-net is a cost rather than a saving.",
+          "gridPos": { "x": 12, "y": 118, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (extraction) (rate(gas_killer_evmsketch_trace_fetch_seconds_count[5m])) * 60",
+              "legendFormat": "{{ "{{" }} extraction {{ "}}" }}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "id": 95,
+          "type": "timeseries",
+          "title": "Cache Hit Ratio",
+          "description": "Executor-cache and digest-cache hit ratios. The executor cache is what the speculative pre-build fills, so its ratio is that feature's scorecard. A digest-cache hit skips the whole analysis, so a high ratio there means the phase histograms describe fewer runs than the task rate suggests.",
+          "gridPos": { "x": 0, "y": 126, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum(rate(gas_killer_evmsketch_executor_cache_total{result=\"hit\"}[5m])) / sum(rate(gas_killer_evmsketch_executor_cache_total[5m]))",
+              "legendFormat": "executor cache"
+            },
+            {
+              "expr": "sum(rate(gas_killer_evmsketch_digest_cache_total{result=\"hit\"}[5m])) / sum(rate(gas_killer_evmsketch_digest_cache_total[5m]))",
+              "legendFormat": "digest cache"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+        },
+        {
+          "id": 96,
+          "type": "timeseries",
+          "title": "Analysis Cost: Router vs Operators (p95)",
+          "description": "The same metric on both sides. The router pays this on the height-assignment path, so it is serial with the round; the operators pay it in parallel with each other. A router figure comparable to the operators' is the argument for moving enrichment off the assignment path.",
+          "gridPos": { "x": 12, "y": 126, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_node_evmsketch_duration_seconds_bucket{job=~\".*gas-killer.*router.*\"}[5m])))",
+              "legendFormat": "router enrichment"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_node_evmsketch_duration_seconds_bucket{job=~\".*gas-killer.*node.*\"}[5m])))",
+              "legendFormat": "operator validation"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gas_killer_storage_computation_seconds_bucket[5m])))",
+              "legendFormat": "router incl. chain resolution"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" } }
         }
       ]
     }

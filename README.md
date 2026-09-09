@@ -279,7 +279,33 @@ The pipeline's shape, as opposed to the cost of one round:
 | `reporter_certified_total`, `reporter_skipped_total` | What the operators actually signed |
 | `network_spawner_messages_rate_limited_total{peer,message}` | Messages the *receiving* peer throttled, by channel (`data_0` acks, `data_1` directives, `data_2` Schnorr) |
 
-Two of these need reading together rather than alone.
+Where the time inside one gas analysis goes. Both the router and the operators publish these,
+separated by the scrape target:
+
+| Metric | Meaning |
+|---|---|
+| `gas_killer_evmsketch_trace_fetch_seconds{extraction}` | Awaiting trace RPCs: network plus *remote* node CPU |
+| `gas_killer_evmsketch_parse_seconds{extraction}` | Turning struct logs into state updates: local CPU, `O(execution steps)` |
+| `gas_killer_evmsketch_executor_build_seconds{extraction}` | Resolving the revm executor. Overlaps trace fetch — never add the two |
+| `gas_killer_evmsketch_state_prefetch_seconds{extraction}` | One `eth_getProof` per hinted address |
+| `gas_killer_evmsketch_revm_estimate_seconds{extraction}` | Pricing the payload under revm: local CPU |
+| `gas_killer_evmsketch_executor_cache_total{result}` | Executor-cache hit/miss — the speculative pre-build's scorecard |
+| `gas_killer_evmsketch_digest_cache_total{result}` | Digest-cache hit/miss; a hit skips the whole analysis |
+| `gas_killer_node_evmsketch_duration_seconds` | The whole analysis call, cache-miss path only. The `node` in the name is historical: both the router and the operators emit it, distinguished by the scrape target |
+| `gas_killer_storage_computation_seconds` | Router only, and broader: chain detection plus the transition-index read plus the analysis |
+
+`extraction` is `prestate_net`, `struct_log`, or `prestate_fallback`. The net form reads two cheap
+tracers and never fetches or parses a struct-log trace, so it has **no** `parse_seconds` series at
+all — that absence is the `STATE_ENCODING=prestate-net` saving, measured rather than inferred. A
+`prestate_fallback` run attempted the net form, could not represent the call, and paid for both
+paths, so a high fallback share is the workload shape where `prestate-net` costs more than it
+saves.
+
+To answer "is this workload RPC-bound or CPU-bound", compare seconds of work per second from the
+histogram sums rather than percentiles: `trace_fetch + state_prefetch` against
+`parse + revm_estimate`.
+
+Three of these need reading together rather than alone.
 
 `gas_killer_directive_sends_total` and `network_spawner_messages_rate_limited_total` are opposite
 ends of the same channel and neither substitutes for the other. The send-side counter exists

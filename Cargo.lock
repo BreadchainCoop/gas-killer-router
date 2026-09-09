@@ -4082,7 +4082,7 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 [[package]]
 name = "gas-analyzer-core"
 version = "0.1.0"
-source = "git+https://github.com/gas-killer/gas-analyzer#df27c08c612d2a3dff747c2f9a286c7fbdf9c889"
+source = "git+https://github.com/gas-killer/gas-analyzer#3cbd54f802da8c6a25572e42145aedd51cb9a95e"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types",
@@ -4097,7 +4097,7 @@ dependencies = [
 [[package]]
 name = "gas-analyzer-estimator"
 version = "0.1.0"
-source = "git+https://github.com/gas-killer/gas-analyzer#df27c08c612d2a3dff747c2f9a286c7fbdf9c889"
+source = "git+https://github.com/gas-killer/gas-analyzer#3cbd54f802da8c6a25572e42145aedd51cb9a95e"
 dependencies = [
  "alloy-dyn-abi",
  "alloy-primitives",
@@ -4113,7 +4113,7 @@ dependencies = [
 [[package]]
 name = "gas-analyzer-evmsketch"
 version = "0.1.0"
-source = "git+https://github.com/gas-killer/gas-analyzer#df27c08c612d2a3dff747c2f9a286c7fbdf9c889"
+source = "git+https://github.com/gas-killer/gas-analyzer#3cbd54f802da8c6a25572e42145aedd51cb9a95e"
 dependencies = [
  "alloy",
  "alloy-eips",
@@ -4138,7 +4138,7 @@ dependencies = [
 [[package]]
 name = "gas-analyzer-rpc"
 version = "0.1.0"
-source = "git+https://github.com/gas-killer/gas-analyzer#df27c08c612d2a3dff747c2f9a286c7fbdf9c889"
+source = "git+https://github.com/gas-killer/gas-analyzer#3cbd54f802da8c6a25572e42145aedd51cb9a95e"
 dependencies = [
  "alloy",
  "alloy-eips",
@@ -10497,7 +10497,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

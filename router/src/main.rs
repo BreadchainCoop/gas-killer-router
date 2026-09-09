@@ -38,11 +38,11 @@ use eigen_logging::log_level::LogLevel;
 use gas_killer_common::get_operator_states;
 use gas_killer_common::{
     APPLICATION_NAMESPACE, ConfigMetrics, GasKillerTaskData, GasKillerValidator,
-    IngressStalenessWindow, SignatureScheme, SpeculativePrebuildConfig, ack_messages_per_second,
-    agg_activity_timeout, agg_window, config_fingerprint, load_key_from_file, p2p_message_backlog,
-    p2p_quota_period, quorum_threshold_fraction, rebroadcast_interval, round_timeout,
-    schnorr_messages_per_second, schnorr_stage_timeout, signature_scheme, storage_directory,
-    task_ttl,
+    IngressStalenessWindow, SignatureScheme, SpeculativePrebuildConfig, ValidatorMetrics,
+    ack_messages_per_second, agg_activity_timeout, agg_window, config_fingerprint,
+    load_key_from_file, p2p_message_backlog, p2p_quota_period, quorum_threshold_fraction,
+    rebroadcast_interval, round_timeout, schnorr_messages_per_second, schnorr_stage_timeout,
+    signature_scheme, storage_directory, task_ttl,
 };
 use gas_killer_router::directive_metrics::CountingSender;
 use gas_killer_router::expiry::run_expiry_sweeper;
@@ -379,9 +379,15 @@ fn main() {
 
         // Shared validator: the sequencer uses it for EVMSketch enrichment; its
         // speculative pre-build loop warms the executor cache off the hot path.
+        //
+        // The router's own analysis is instrumented with the same metrics the operators use, so
+        // the enrichment on the assignment path is comparable with the validation the operators
+        // run — and so a slow round can be attributed to whichever side actually paid for it.
+        let validator_metrics = Arc::new(ValidatorMetrics::new());
         let validator = Arc::new(
             GasKillerValidator::new()
-                .expect("HTTP_RPC environment variable must be set for gas analyzer"),
+                .expect("HTTP_RPC environment variable must be set for gas analyzer")
+                .with_validator_metrics(Arc::clone(&validator_metrics)),
         );
         {
             let spec_validator = Arc::clone(&validator);
@@ -697,6 +703,7 @@ fn main() {
             context: Arc::new(context.child("metrics_view")),
             metrics: Arc::clone(&metrics),
             config_metrics: Arc::new(ConfigMetrics::new(&fingerprint)),
+            validator_metrics: Arc::clone(&validator_metrics),
         };
         context.child("healthz").spawn(move |_| async move {
             let app = build_operator_app().with_state(health_state);

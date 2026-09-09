@@ -140,7 +140,12 @@ pub struct MetricsCollector {
     /// Tasks the startup re-queue settled `expired` because their transition index had already
     /// been applied on chain, rather than re-running work the contract would reject.
     pub tasks_expired_at_requeue: Counter<u64, AtomicU64>,
-    /// EVM storage-update computation duration (seconds).
+    /// Wall-clock seconds the sequencer spent turning one request into storage updates:
+    /// chain detection, the transition-index read where one is needed, and the gas analysis.
+    ///
+    /// Deliberately broader than `gas_killer_evmsketch_duration_seconds`, which covers only the
+    /// analysis call — the difference between them is the chain-resolution overhead on the
+    /// assignment path.
     pub storage_computation_seconds: Histogram,
     /// Aggregation rounds that ended in a successful verifyAndUpdate transaction.
     pub aggregation_rounds_completed: Counter<u64, AtomicU64>,
@@ -284,7 +289,7 @@ impl MetricsCollector {
             Histogram::new([0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, 120.0, 300.0]);
         registry.register(
             "gas_killer_storage_computation_seconds",
-            "EVM storage-update computation duration in seconds",
+            "Seconds spent turning one request into storage updates: chain detection, the transition-index read, and gas analysis",
             storage_computation_seconds.clone(),
         );
 
