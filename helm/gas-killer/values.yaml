@@ -611,8 +611,15 @@ schnorr:
   # in flight must exceed the round duration plus eigenlayer.sdk.blockStaleMeasure.
   noticeWindow: 0
 
-  # Reuse an already-populated SchnorrStakeRegistry instead of deploying a fresh one. Its
-  # operator set is assumed complete, so the job submits no registrations. Leave empty to deploy.
+  # The SchnorrStakeRegistry this deployment uses, read by two things:
+  #
+  #   - the schnorr-operators job reuses it instead of deploying a fresh one, assuming its operator
+  #     set is complete, so it submits no registrations. Leave empty to deploy one.
+  #   - the router publishes it as `schnorrStakeRegistry` on GET /avs-metadata, in either scheme.
+  #     Under bls the router never verifies against it; publishing is what lets an integrator wire
+  #     a target that accepts both schemes before the fleet switches. Left empty, the router reads
+  #     the registry the operator-set job recorded in avs_deploy.json, which needs that job's
+  #     record to have reached the router's copy of the file.
   stakeRegistryAddress: ""
 
   # Per-stage timeout (nonce collection, partial collection) for the coordinator's rounds, in

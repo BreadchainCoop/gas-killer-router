@@ -11,6 +11,12 @@
 //! first, then `deploy_example`, which reads the registry address back out of the deployment
 //! JSON via `$deploy:schnorrStakeRegistry`.
 //!
+//! `SCHNORR_REGISTRY_ONLY` deploys and records the registry without registering anyone, for a
+//! deployment publishing the address before it has an operator set to put in it: a target's
+//! constructor takes that address, so an integrator can wire one and settle under whichever
+//! scheme the fleet runs. The registry verifies nothing until operators are registered, which its
+//! owner can do later into the same registry.
+//!
 //! Only meaningful under `SIGNATURE_SCHEME=schnorr`; the BLS stack verifies against a
 //! `BLSSignatureChecker` from the EigenLayer deployment and needs none of this.
 
@@ -18,6 +24,7 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
+use gas_killer_common::avs_contracts::SCHNORR_STAKE_REGISTRY_KEY;
 use gas_killer_common::schnorr::{PrivateKey, private_key_from_hex};
 use gas_killer_common::{
     SignatureScheme, quorum_threshold_fraction, schnorr_notice_window, signature_scheme,
@@ -34,10 +41,6 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 /// Operator key files the eigenlayer setup container writes next to the deployment JSON. The
 /// Schnorr signing key IS the operator's secp256k1 key.
 const OPERATOR_KEY_FILE_SUFFIX: &str = ".private.ecdsa.key.json";
-
-/// Deployment-JSON key the registry address is recorded under, and the one `deploy_example`
-/// resolves for `$deploy:schnorrStakeRegistry`.
-const REGISTRY_KEY: &str = "schnorrStakeRegistry";
 
 #[derive(Debug, Deserialize)]
 struct OperatorKeyFile {
@@ -77,10 +80,23 @@ async fn main() -> Result<(), DynError> {
     // target contract verifies.
     let avs_address = read_avs_address(&avs_deployment_path)?;
 
+    // Deploy the registry and stop. Read before anything is loaded or deployed so the choice is
+    // visible in the log above the addresses it produces.
+    let registry_only = env_flag("SCHNORR_REGISTRY_ONLY");
+
     // The operators' Schnorr keys are their existing secp256k1 keys, read from the key files the
-    // eigenlayer setup container produced.
-    let operator_keys = load_operator_keys(&avs_deployment_path)?;
-    println!("🔑 Loaded {} operator key(s)", operator_keys.len());
+    // eigenlayer setup container produced. Loaded before the registry exists, so a volume missing
+    // them fails with the reason rather than after deploying a registry nobody is in.
+    let operator_keys = if registry_only {
+        println!(
+            "📋 SCHNORR_REGISTRY_ONLY: deploying the registry without registering an operator set"
+        );
+        Vec::new()
+    } else {
+        let keys = load_operator_keys(&avs_deployment_path)?;
+        println!("🔑 Loaded {} operator key(s)", keys.len());
+        keys
+    };
 
     // The deployer owns the registry (stand-in for the EigenLayer registration lifecycle).
     let signer: PrivateKeySigner = private_key
@@ -144,7 +160,12 @@ async fn main() -> Result<(), DynError> {
         }
     };
 
-    if register_operators {
+    if registry_only {
+        println!(
+            "⏭️  SCHNORR_REGISTRY_ONLY: no operator registered. The registry verifies nothing \
+             until one is, and its owner {deployer} is who can register them."
+        );
+    } else if register_operators {
         register_operator_set(&provider, registry_address, &operator_keys).await?;
     }
 
@@ -154,7 +175,8 @@ async fn main() -> Result<(), DynError> {
     println!("  SchnorrStakeRegistry: {registry_address}");
     println!("  AVS service manager:  {avs_address}");
     println!(
-        "\nNext: deploy a target, which reads the registry via $deploy:{REGISTRY_KEY}\n  \
+        "\nNext: deploy a target, which reads the registry via \
+         $deploy:{SCHNORR_STAKE_REGISTRY_KEY}\n  \
          cargo run -p scripts --bin deploy_example -- --example schnorrArraySummation"
     );
     Ok(())
@@ -291,14 +313,28 @@ fn record_registry_address(avs_deployment_path: &str, registry: Address) -> Resu
     if !deployment["addresses"].is_object() {
         deployment["addresses"] = serde_json::json!({});
     }
-    deployment["addresses"][REGISTRY_KEY] = serde_json::json!(format!("{registry:?}"));
+    deployment["addresses"][SCHNORR_STAKE_REGISTRY_KEY] =
+        serde_json::json!(format!("{registry:?}"));
 
     let serialized = serde_json::to_string_pretty(&deployment)
         .map_err(|e| format!("Failed to serialize deployment JSON: {e}"))?;
     fs::write(avs_deployment_path, serialized)
         .map_err(|e| format!("Failed to write deployment JSON: {e}"))?;
-    println!("📝 recorded addresses.{REGISTRY_KEY} = {registry:?}");
+    println!("📝 recorded addresses.{SCHNORR_STAKE_REGISTRY_KEY} = {registry:?}");
     Ok(())
+}
+
+/// Reads a boolean environment variable, accepting `true` and `1` case-insensitively. Anything
+/// else, including unset, is false: a mistyped flag must not silently skip the registrations.
+fn env_flag(name: &str) -> bool {
+    parse_flag(env::var(name).ok().as_deref())
+}
+
+fn parse_flag(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("true" | "1")
+    )
 }
 
 fn env_address(name: &str) -> Result<Option<Address>, DynError> {
@@ -309,5 +345,22 @@ fn env_address(name: &str) -> Result<Option<Address>, DynError> {
             })?))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_flag;
+
+    #[test]
+    fn only_true_and_one_enable_a_flag() {
+        for raw in ["true", "TRUE", " True ", "1"] {
+            assert!(parse_flag(Some(raw)), "{raw} should enable the flag");
+        }
+        // A mistyped value reads as off, which runs the registrations rather than skipping them.
+        for raw in ["", "yes", "on", "0", "false", "ture"] {
+            assert!(!parse_flag(Some(raw)), "{raw} should not enable the flag");
+        }
+        assert!(!parse_flag(None));
     }
 }

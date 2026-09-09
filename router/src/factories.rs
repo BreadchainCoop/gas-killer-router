@@ -32,7 +32,9 @@ use commonware_avs_eigenlayer::AvsDeployment;
 use commonware_avs_router::reporter::CertifiedReceiver;
 use commonware_avs_router::sequencer::{DispatchTime, ResolutionSender, SharedAssignments};
 use commonware_avs_router::submitter::Submitter;
-use gas_killer_common::avs_contracts::{self, ContractsConfig, ResolvedContracts};
+use gas_killer_common::avs_contracts::{
+    self, ContractsConfig, ResolvedContracts, SCHNORR_STAKE_REGISTRY_KEY,
+};
 use gas_killer_common::bindings::bls_apk_registry::BLSApkRegistry;
 use gas_killer_common::bindings::bls_sig_check_operator_state_retriever::BLSSigCheckOperatorStateRetriever;
 use gas_killer_common::task_data::GasKillerTaskData;
@@ -41,7 +43,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use std::{env, str::FromStr, sync::Arc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Quorum 0 — the only quorum this deployment operates on.
 const QUORUM_NUMBERS: &[u8] = &[0x00];
@@ -468,11 +470,11 @@ pub async fn requeue_incomplete_tasks(
 /// Starts background resolution of the `contracts` block on `GET /avs-metadata`, filling `slot`
 /// once the addresses are established. See [`gas_killer_common::avs_contracts`].
 ///
-/// Everything it needs comes from the running deployment: the operators' registry coordinator
-/// through the same `avs_deploy.json` loader the submitter reads, and the AVS/checker pair from a
-/// live target's own getters. Anything missing leaves the block off — the endpoint's other fields
-/// are identity information still worth serving, and an integrator reads an absent block as "no
-/// authoritative answer" rather than being handed a wrong one.
+/// Everything it needs comes from the running deployment: the operators' registry coordinator and
+/// the Schnorr stake registry through the same `avs_deploy.json` loader the submitter reads, and the
+/// AVS/checker pair from a live target's own getters. Anything missing leaves the block off, because
+/// the endpoint's other fields are identity information still worth serving, and an integrator reads
+/// an absent block as "no authoritative answer" rather than being handed a wrong one.
 fn spawn_contracts_resolver(
     providers: &HashMap<ChainRole, gas_killer_common::ReadOnlyProvider>,
     slot: ResolvedContracts,
@@ -489,9 +491,18 @@ fn spawn_contracts_resolver(
         );
         return;
     };
-    let registry_coordinator = match AvsDeployment::load()
-        .and_then(|deployment| deployment.registry_coordinator_address())
-    {
+    let deployment = match AvsDeployment::load() {
+        Ok(deployment) => deployment,
+        Err(e) => {
+            error!(
+                error = %e,
+                "could not read the AVS deployment; /avs-metadata will omit settlement contract \
+                 addresses"
+            );
+            return;
+        }
+    };
+    let registry_coordinator = match deployment.registry_coordinator_address() {
         Ok(address) => address,
         Err(e) => {
             error!(
@@ -500,6 +511,21 @@ fn spawn_contracts_resolver(
                  will omit settlement contract addresses"
             );
             return;
+        }
+    };
+    // The operator-set job records the Schnorr registry here after deploying it. An absent key is
+    // the normal state for a deployment that has provisioned none, and `custom_address` reports
+    // that the same way it reports a malformed value, so this degrades to "none" either way and
+    // logs the reason for anyone chasing a field that did not appear.
+    let schnorr_stake_registry = match deployment.custom_address(SCHNORR_STAKE_REGISTRY_KEY) {
+        Ok(address) => Some(address),
+        Err(e) => {
+            debug!(
+                error = %e,
+                "no {SCHNORR_STAKE_REGISTRY_KEY} in the AVS deployment; /avs-metadata publishes \
+                 one only if SCHNORR_STAKE_REGISTRY_ADDRESS is set"
+            );
+            None
         }
     };
     let config = match ContractsConfig::from_env() {
@@ -516,6 +542,7 @@ fn spawn_contracts_resolver(
     avs_contracts::spawn_resolver(
         provider.clone(),
         registry_coordinator,
+        schnorr_stake_registry,
         deployment_path,
         config,
         slot,
