@@ -24,13 +24,17 @@
 //! - The two are then cross-checked: the checker's own `registryCoordinator()` must be the
 //!   coordinator the operators are registered in. A mismatch means the reference target belongs to
 //!   a superseded deployment, so nothing is published rather than publishing a pair that reverts.
+//! - `schnorrStakeRegistry` comes from `SCHNORR_STAKE_REGISTRY_ADDRESS`, or failing that from
+//!   `avs_deploy.json`, and publishes only once a registry answers at it. A target's registry is
+//!   fixed by its constructor, so a wrong one settles BLS rounds today and can never settle a
+//!   Schnorr round: a mistake that surfaces at a scheme cutover, long after it was made.
 //! - `demoTarget` and `demoFactory` come from configuration or, failing that, from what the
 //!   playground job recorded. The playground target doubles as the preferred reference target, so
 //!   the checker published is the one `demoTarget.blsSignatureChecker()` itself returns.
 //!
-//! Resolution costs four RPC round-trips, so the answer is cached in a [`ResolvedContracts`] slot
-//! rather than recomputed per use: `/avs-metadata` is public and unauthenticated, and serving it
-//! must not turn into an RPC amplifier.
+//! Resolution costs up to eight RPC round-trips, so the answer is cached in a
+//! [`ResolvedContracts`] slot rather than recomputed per use: `/avs-metadata` is public and
+//! unauthenticated, and serving it must not turn into an RPC amplifier.
 //!
 //! The slot holds the most complete set established so far, and a background resolver keeps
 //! refining it. That matters because the records it reads are written by deploy jobs that can
@@ -46,6 +50,7 @@ use std::time::Duration;
 
 use crate::bindings::IBLSSignatureCheckerRegistry;
 use crate::bindings::gaskillersdk::GasKillerSDK;
+use crate::bindings::schnorrstakeregistry::ISchnorrStakeRegistry;
 use alloy_primitives::Address;
 use alloy_provider::Provider;
 use anyhow::Context;
@@ -75,9 +80,16 @@ const DEMO_TARGET_FILE_ENV: &str = "DEMO_TARGET_FILE";
 /// target only they are advancing.
 const DEMO_FACTORY_FILE_ENV: &str = "DEMO_FACTORY_FILE";
 
-/// How long one resolution attempt may run before it is abandoned and retried. Four sequential RPC
-/// round-trips sit behind it, and this runs during startup, so an unresponsive provider must not
-/// stall the router indefinitely.
+/// Key the AVS deployment JSON records the Schnorr stake registry under.
+///
+/// Public because the writer and the reader are different binaries: the operator-set job records it
+/// after deploying the registry, and the router reads it back to publish. A rename on one side
+/// alone would degrade into an absent field rather than an error, so both use this.
+pub const SCHNORR_STAKE_REGISTRY_KEY: &str = "schnorrStakeRegistry";
+
+/// How long one resolution attempt may run before it is abandoned and retried. Up to eight
+/// sequential RPC round-trips sit behind it, and this runs during startup, so an unresponsive
+/// provider must not stall the router indefinitely.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Delay before the first retry of a failed resolution, doubled on each further failure up to
@@ -117,6 +129,19 @@ pub struct AvsContracts {
     #[serde(rename = "registryCoordinator", serialize_with = "checksummed")]
     #[schema(value_type = crate::openapi::Address)]
     pub registry_coordinator: Address,
+    /// `SchnorrStakeRegistry` a target verifies aggregate Schnorr signatures against.
+    ///
+    /// Published so a target can be wired to both schemes at once. A fleet signs exactly one of
+    /// them, fixed by its own `SIGNATURE_SCHEME`, and probes only that scheme's ERC-165 ID, so a
+    /// target that accepts both settles under either without redeploying across a cutover. Absent
+    /// while the deployment has provisioned no registry, which is every BLS-only one.
+    #[serde(
+        rename = "schnorrStakeRegistry",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "checksummed_opt"
+    )]
+    #[schema(value_type = Option<crate::openapi::Address>, nullable = false)]
+    pub schnorr_stake_registry: Option<Address>,
     /// A deployed target anyone may submit against, for a first settlement with no Solidity
     /// written. Shared, so concurrent readers can invalidate each other's payloads on
     /// `transitionIndex`; `demoFactory` is the way to avoid that. Absent when none is configured.
@@ -235,6 +260,9 @@ pub struct ContractsConfig {
     pub demo_factory: Option<Address>,
     /// [`DEMO_FACTORY_FILE_ENV`]: file the playground job records its factory in.
     pub demo_factory_file: Option<PathBuf>,
+    /// `SCHNORR_STAKE_REGISTRY_ADDRESS`: overrides the registry the AVS deployment JSON records,
+    /// for a deployment whose registry was provisioned outside the chart's job.
+    pub schnorr_stake_registry: Option<Address>,
 }
 
 impl ContractsConfig {
@@ -243,16 +271,17 @@ impl ContractsConfig {
     /// A set-but-unparseable pin is an error rather than a silent `None`: it would otherwise fall
     /// through to the deploy job's record and publish a *different* pair than the operator asked
     /// for, on an endpoint whose whole purpose is that nobody reads a wrong address. The demo
-    /// contracts are documentation pointers, so a typo there warns and omits the field instead of
-    /// withholding the settlement addresses.
+    /// contracts and the Schnorr registry are not, so a typo in one of those warns and omits its
+    /// own field instead of withholding the settlement addresses beside it.
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             reference_target: address_from_env("AVS_REFERENCE_TARGET")?,
             reference_target_file: non_empty_env(REFERENCE_TARGET_FILE_ENV).map(PathBuf::from),
-            demo_target: demo_address_from_env("DEMO_TARGET_ADDRESS"),
+            demo_target: lenient_address_from_env("DEMO_TARGET_ADDRESS"),
             demo_target_file: non_empty_env(DEMO_TARGET_FILE_ENV).map(PathBuf::from),
-            demo_factory: demo_address_from_env("DEMO_FACTORY_ADDRESS"),
+            demo_factory: lenient_address_from_env("DEMO_FACTORY_ADDRESS"),
             demo_factory_file: non_empty_env(DEMO_FACTORY_FILE_ENV).map(PathBuf::from),
+            schnorr_stake_registry: lenient_address_from_env("SCHNORR_STAKE_REGISTRY_ADDRESS"),
         })
     }
 }
@@ -278,16 +307,17 @@ fn address_from_env(key: &str) -> anyhow::Result<Option<Address>> {
         .transpose()
 }
 
-/// [`address_from_env`] for a demo contract, degraded to `None` with a warning on a malformed
-/// value so a documentation pointer's typo cannot suppress the settlement addresses.
-fn demo_address_from_env(key: &str) -> Option<Address> {
+/// [`address_from_env`] for a field whose own typo must not suppress the settlement addresses,
+/// degrading a malformed value to `None` with a warning.
+///
+/// Used for the demo pointers and the Schnorr registry. Not for the reference target: that one
+/// establishes the pair, so a wrong value there would publish a *different* pair than the operator
+/// asked for rather than leaving a field off.
+fn lenient_address_from_env(key: &str) -> Option<Address> {
     match address_from_env(key) {
         Ok(address) => address,
         Err(e) => {
-            warn!(
-                error = %e,
-                "ignoring a malformed demo contract address; /avs-metadata will omit it"
-            );
+            warn!(error = %e, "ignoring a malformed address; /avs-metadata will omit that field");
             None
         }
     }
@@ -308,11 +338,12 @@ fn read_recorded_address(path: &Path) -> anyhow::Result<Address> {
     )
 }
 
-/// Tracks whether any record a deploy job is expected to write is still unread.
+/// Tracks whether anything the set could still grow by is outstanding: a record a deploy job is
+/// expected to write and has not, or an address that did not verify on chain.
 ///
-/// An unreadable record does not fail an attempt — one job that has not finished, or has failed for
-/// good, must not withhold the addresses it has nothing to do with. It does mean the set is
-/// incomplete, so the resolver keeps going until nothing named is outstanding.
+/// Neither fails an attempt, because one job that has not finished, or has failed for good, must
+/// not withhold the addresses it has nothing to do with. Both mean the set is incomplete, so the
+/// resolver keeps going until nothing named is outstanding.
 #[derive(Debug, Default)]
 struct Records {
     pending: bool,
@@ -387,12 +418,13 @@ fn reference_target(
     records.read(&sibling)
 }
 
-/// Keeps a demo address only if it has code on the chain the block publishes.
+/// Keeps a configured address only if it has code on the chain the block publishes.
 ///
-/// The demo contracts are free-form configuration, so unlike the AVS trio nothing about them proves
-/// they are on this chain — an address could name a contract on another network, or be
-/// checksum-valid and simply wrong. Checking for code is what makes `chainId` true of the whole
-/// block. An RPC failure propagates so the attempt is retried rather than publishing a partial set.
+/// The demo contracts and the Schnorr registry are free-form configuration, so unlike the AVS trio
+/// nothing about them proves they are on this chain: an address could name a contract on another
+/// network, or be checksum-valid and simply wrong. Checking for code is what makes `chainId` true of
+/// the whole block. An RPC failure propagates so the attempt is retried rather than publishing a
+/// partial set.
 async fn deployed_on_chain<P: Provider>(
     provider: &P,
     field: &str,
@@ -409,11 +441,59 @@ async fn deployed_on_chain<P: Provider>(
         warn!(
             %address,
             field,
-            "no code at the configured demo contract on this chain; /avs-metadata will omit it"
+            "no code at the configured address on this chain; /avs-metadata will omit it"
         );
         return Ok(None);
     }
     Ok(Some(address))
+}
+
+/// Keeps a Schnorr stake registry address only if a registry answers at it.
+///
+/// The probe is `nextPossibleMutationBlock()`, which `SchnorrStakeRegistry` declares and the
+/// BLS-side contracts do not, so a checker, a coordinator or a target pasted here reverts on an
+/// unknown selector and is left off. It is an answer rather than a proof of type: a contract with a
+/// permissive fallback would pass. Worth the round trip anyway, because nothing downstream would
+/// catch the mistake: a BLS fleet never reads this address, and a target's own registry is fixed by
+/// its constructor, so a target wired to a wrong one settles BLS rounds today and can never settle a
+/// Schnorr round.
+///
+/// An address that does not answer is omitted and left outstanding rather than treated as final, so
+/// a registry provisioned after the router started is picked up without a restart and a provider
+/// blip is retried. It is never fatal: an unverifiable registry must not withhold the addresses
+/// beside it, which are the ones a BLS fleet is settling against.
+async fn registry_on_chain<P: Provider>(
+    provider: &P,
+    configured: Option<Address>,
+    records: &mut Records,
+) -> anyhow::Result<Option<Address>> {
+    let Some(address) = deployed_on_chain(provider, SCHNORR_STAKE_REGISTRY_KEY, configured).await?
+    else {
+        // No code where an address was configured is worth another attempt; nothing configured at
+        // all is a final answer. Set rather than assigned: another field may already be waiting on
+        // a record, and this must not report the set complete on its behalf.
+        if configured.is_some() {
+            records.pending = true;
+        }
+        return Ok(None);
+    };
+    match ISchnorrStakeRegistry::new(address, provider)
+        .nextPossibleMutationBlock()
+        .call()
+        .await
+    {
+        Ok(_) => Ok(Some(address)),
+        Err(error) => {
+            warn!(
+                %address,
+                %error,
+                "the configured schnorrStakeRegistry does not answer nextPossibleMutationBlock(); \
+                 /avs-metadata will omit it and try again"
+            );
+            records.pending = true;
+            Ok(None)
+        }
+    }
 }
 
 /// What one resolution attempt established.
@@ -422,9 +502,10 @@ pub struct Resolution {
     /// The set to publish, or `None` when no reference target answered and there is therefore no
     /// pair to read.
     pub contracts: Option<AvsContracts>,
-    /// Whether a record a deploy job is expected to write is still unread, so the set may yet grow.
-    /// The resolver keeps attempting while this holds; when it is false the answer is as complete as
-    /// this configuration allows and resolution is done.
+    /// Whether anything the set could still grow by is outstanding, so it is worth re-establishing:
+    /// a record a deploy job is expected to write and has not, or an address that did not verify on
+    /// chain. The resolver keeps attempting while this holds; when it is false the answer is as
+    /// complete as this configuration allows and resolution is done.
     pub incomplete: bool,
 }
 
@@ -433,9 +514,15 @@ pub struct Resolution {
 /// An error is a failed attempt — something that should have answered did not, or the pair that came
 /// back is not the operators' own. A record that is merely unread is not an error: it leaves
 /// [`Resolution::incomplete`] set so the caller tries again, having published whatever else stands.
+///
+/// `deployment_schnorr_registry` is what the AVS deployment JSON records under
+/// [`SCHNORR_STAKE_REGISTRY_KEY`], read by the caller because it owns the parser for that file.
+/// `SCHNORR_STAKE_REGISTRY_ADDRESS` wins over it, so a registry provisioned outside the chart's job
+/// can be published without editing the deployment file the operators' jobs own.
 pub async fn resolve<P: Provider>(
     provider: &P,
     registry_coordinator: Address,
+    deployment_schnorr_registry: Option<Address>,
     deployment_path: &Path,
     config: &ContractsConfig,
 ) -> anyhow::Result<Resolution> {
@@ -491,6 +578,14 @@ pub async fn resolve<P: Provider>(
         config.demo_factory_file.as_deref(),
         &mut records,
     );
+    let schnorr_stake_registry = registry_on_chain(
+        provider,
+        config
+            .schnorr_stake_registry
+            .or(deployment_schnorr_registry),
+        &mut records,
+    )
+    .await?;
 
     Ok(Resolution {
         contracts: Some(AvsContracts {
@@ -498,6 +593,7 @@ pub async fn resolve<P: Provider>(
             avs_address,
             bls_signature_checker,
             registry_coordinator,
+            schnorr_stake_registry,
             demo_target: deployed_on_chain(provider, "demoTarget", demo_target).await?,
             demo_factory: deployed_on_chain(provider, "demoFactory", demo_factory).await?,
         }),
@@ -521,6 +617,7 @@ pub async fn resolve<P: Provider>(
 pub fn spawn_resolver<P: Provider + 'static>(
     provider: P,
     registry_coordinator: Address,
+    deployment_schnorr_registry: Option<Address>,
     deployment_path: PathBuf,
     config: ContractsConfig,
     slot: ResolvedContracts,
@@ -528,7 +625,13 @@ pub fn spawn_resolver<P: Provider + 'static>(
     tokio::spawn(async move {
         let mut backoff = RETRY_INITIAL_BACKOFF;
         loop {
-            let attempt = resolve(&provider, registry_coordinator, &deployment_path, &config);
+            let attempt = resolve(
+                &provider,
+                registry_coordinator,
+                deployment_schnorr_registry,
+                &deployment_path,
+                &config,
+            );
             match tokio::time::timeout(RESOLVE_TIMEOUT, attempt).await {
                 Ok(Ok(resolution)) => {
                     match resolution.contracts {
@@ -537,6 +640,7 @@ pub fn spawn_resolver<P: Provider + 'static>(
                         Some(contracts) => {
                             let demo_target = contracts.demo_target;
                             let demo_factory = contracts.demo_factory;
+                            let schnorr_stake_registry = contracts.schnorr_stake_registry;
                             let published = slot.publish(contracts.clone());
                             if published {
                                 info!(
@@ -544,6 +648,7 @@ pub fn spawn_resolver<P: Provider + 'static>(
                                     bls_signature_checker = %contracts.bls_signature_checker,
                                     registry_coordinator = %contracts.registry_coordinator,
                                     chain_id = contracts.chain_id,
+                                    schnorr_stake_registry = ?schnorr_stake_registry,
                                     demo_target = ?demo_target,
                                     demo_factory = ?demo_factory,
                                     incomplete = resolution.incomplete,
@@ -593,7 +698,7 @@ pub fn deployment_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use alloy::sol_types::SolValue;
-    use alloy_primitives::{Bytes, U64, address};
+    use alloy_primitives::{Bytes, U64, U256, address};
     use alloy_provider::{ProviderBuilder, mock::Asserter};
 
     const TARGET: Address = address!("F143a9D93045474C2B573d21AC1CCe8dB2b06dbD");
@@ -604,6 +709,8 @@ mod tests {
     const DEMO: Address = address!("00000000000000000000000000000000000000aa");
     const PLAYGROUND: Address = address!("00000000000000000000000000000000000000cc");
     const FACTORY: Address = address!("00000000000000000000000000000000000000dd");
+    const REGISTRY: Address = address!("00000000000000000000000000000000000000ee");
+    const OTHER_REGISTRY: Address = address!("00000000000000000000000000000000000000ff");
     fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, body).expect("writing fixture");
@@ -838,7 +945,9 @@ mod tests {
     //   2. eth_call   avsAddress()
     //   3. eth_call   blsSignatureChecker()
     //   4. eth_call   registryCoordinator() on the checker
-    //   5. eth_getCode demoTarget, then demoFactory, each only when one was established
+    //   5. eth_getCode then eth_call nextPossibleMutationBlock() on the schnorr registry, both
+    //      only when one is configured
+    //   6. eth_getCode demoTarget, then demoFactory, each only when one was established
 
     fn mock_provider() -> (impl Provider + Clone, Asserter) {
         let asserter = Asserter::new();
@@ -868,9 +977,21 @@ mod tests {
     }
 
     async fn resolve_pinned<P: Provider>(provider: &P, config: &ContractsConfig) -> Resolution {
-        resolve(provider, COORDINATOR, Path::new(NO_DEPLOYMENT), config)
-            .await
-            .expect("a pinned reference target resolves without error")
+        resolve(
+            provider,
+            COORDINATOR,
+            None,
+            Path::new(NO_DEPLOYMENT),
+            config,
+        )
+        .await
+        .expect("a pinned reference target resolves without error")
+    }
+
+    /// Queues the two reads that accept a registry: code at the address, then the probe answering.
+    fn push_registry(asserter: &Asserter) {
+        asserter.push_success(&Bytes::from(vec![0x60u8]));
+        asserter.push_success(&U256::from(u64::MAX).abi_encode());
     }
 
     #[tokio::test]
@@ -901,6 +1022,7 @@ mod tests {
         let err = resolve(
             &provider,
             COORDINATOR,
+            None,
             Path::new(NO_DEPLOYMENT),
             &pinned(None),
         )
@@ -926,6 +1048,7 @@ mod tests {
         let resolution = resolve(
             &provider,
             COORDINATOR,
+            None,
             &deployment,
             &ContractsConfig::default(),
         )
@@ -996,6 +1119,160 @@ mod tests {
         );
     }
 
+    // -- the schnorr stake registry --
+
+    /// [`resolve`] with a registry recorded in the deployment JSON and nothing else configured.
+    async fn resolve_with_recorded_registry<P: Provider>(
+        provider: &P,
+        recorded: Option<Address>,
+        config: &ContractsConfig,
+    ) -> Resolution {
+        resolve(
+            provider,
+            COORDINATOR,
+            recorded,
+            Path::new(NO_DEPLOYMENT),
+            config,
+        )
+        .await
+        .expect("a pinned reference target resolves without error")
+    }
+
+    #[tokio::test]
+    async fn publishes_the_registry_the_deployment_recorded() {
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+        push_registry(&asserter);
+
+        let resolution =
+            resolve_with_recorded_registry(&provider, Some(REGISTRY), &pinned(None)).await;
+
+        let contracts = resolution.contracts.expect("the pair still publishes");
+        assert_eq!(contracts.schnorr_stake_registry, Some(REGISTRY));
+        assert!(
+            !resolution.incomplete,
+            "a registry that answers leaves nothing outstanding"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_env_override_wins_over_the_recorded_registry() {
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+        push_registry(&asserter);
+
+        let config = ContractsConfig {
+            schnorr_stake_registry: Some(OTHER_REGISTRY),
+            ..pinned(None)
+        };
+        let contracts = resolve_with_recorded_registry(&provider, Some(REGISTRY), &config)
+            .await
+            .contracts
+            .expect("the pair still publishes");
+
+        assert_eq!(
+            contracts.schnorr_stake_registry,
+            Some(OTHER_REGISTRY),
+            "a registry provisioned outside the chart's job must be publishable without editing \
+             the deployment file"
+        );
+    }
+
+    #[tokio::test]
+    async fn omits_a_registry_that_does_not_answer_the_probe() {
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+        asserter.push_success(&Bytes::from(vec![0x60u8]));
+        asserter.push_failure_msg("execution reverted");
+
+        let resolution =
+            resolve_with_recorded_registry(&provider, Some(REGISTRY), &pinned(None)).await;
+
+        let contracts = resolution
+            .contracts
+            .expect("a contract that is not a registry must not withhold the settlement pair");
+        assert!(
+            contracts.schnorr_stake_registry.is_none(),
+            "only nextPossibleMutationBlock() tells a registry apart from a checker pasted in \
+             its place"
+        );
+        assert!(
+            resolution.incomplete,
+            "and it is worth another attempt: the address may be a registry deployed since"
+        );
+    }
+
+    #[tokio::test]
+    async fn omits_a_registry_with_no_code_and_asks_to_be_retried() {
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+        asserter.push_success(&Bytes::new());
+
+        let resolution =
+            resolve_with_recorded_registry(&provider, Some(REGISTRY), &pinned(None)).await;
+
+        let contracts = resolution.contracts.expect("the pair still publishes");
+        assert!(contracts.schnorr_stake_registry.is_none());
+        assert!(
+            resolution.incomplete,
+            "a registry recorded before it was deployed shows up on a later attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_registry_configured_is_a_complete_answer() {
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+
+        // No registry response is queued: with none configured, neither read is made.
+        let resolution = resolve_pinned(&provider, &pinned(None)).await;
+
+        let contracts = resolution.contracts.expect("the pair still publishes");
+        assert!(contracts.schnorr_stake_registry.is_none());
+        assert!(
+            !resolution.incomplete,
+            "a BLS-only deployment has provisioned no registry and never will; retrying forever \
+             would log a misconfiguration that is not one"
+        );
+    }
+
+    /// The router reads the registry back through the same deployment loader the rest of the
+    /// service uses, and that loader names only three keys explicitly: anything else reaches it
+    /// through the `extra` map behind `custom_address`. Pinned against a file in the shape the
+    /// operator-set job writes, because a rename on either side degrades into an absent field
+    /// rather than an error.
+    #[test]
+    fn the_deployment_loader_finds_the_recorded_registry() {
+        let recorded = format!(
+            r#"{{"addresses":{{"registryCoordinator":"{COORDINATOR:?}","blsapkRegistry":"{AVS:?}",
+                "blsSigCheck":"{CHECKER:?}","{SCHNORR_STAKE_REGISTRY_KEY}":"{REGISTRY:?}"}}}}"#
+        );
+        let deployment: commonware_avs_eigenlayer::AvsDeployment =
+            serde_json::from_str(&recorded).expect("a recorded deployment parses");
+
+        assert_eq!(
+            deployment
+                .custom_address(SCHNORR_STAKE_REGISTRY_KEY)
+                .expect("the recorded registry is readable"),
+            REGISTRY
+        );
+
+        // A deployment that has provisioned no registry, which is every BLS-only one. The loader
+        // reports it as an error, which the router degrades to "none configured".
+        let bare = format!(
+            r#"{{"addresses":{{"registryCoordinator":"{COORDINATOR:?}","blsapkRegistry":"{AVS:?}",
+                "blsSigCheck":"{CHECKER:?}"}}}}"#
+        );
+        let deployment: commonware_avs_eigenlayer::AvsDeployment =
+            serde_json::from_str(&bare).expect("a deployment with no registry still parses");
+        assert!(
+            deployment
+                .custom_address(SCHNORR_STAKE_REGISTRY_KEY)
+                .is_err(),
+            "an absent key must be distinguishable from a recorded one"
+        );
+    }
+
     // -- serialization and the published slot --
 
     fn contracts_with(demo_target: Option<Address>) -> AvsContracts {
@@ -1004,6 +1281,7 @@ mod tests {
             avs_address: AVS,
             bls_signature_checker: CHECKER,
             registry_coordinator: COORDINATOR,
+            schnorr_stake_registry: None,
             demo_target,
             demo_factory: None,
         }
@@ -1032,6 +1310,25 @@ mod tests {
         // Round-trips: a client that parses what it was served gets the same addresses back.
         let parsed: AvsContracts = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, contracts);
+
+        // The optional addresses take the same treatment, which is a separate serializer.
+        let with_optionals = AvsContracts {
+            schnorr_stake_registry: Some(address!("b4d3f7c1c8a2e5901f6d0b7a3e9c2d4f5a6b7c8d")),
+            ..contracts_with(Some(address!("dcec8ce0a03848b55989bcc711e424ca31d9eed9")))
+        };
+        let json = serde_json::to_value(&with_optionals).unwrap();
+        assert_eq!(
+            json["schnorrStakeRegistry"],
+            "0xB4d3f7C1c8A2E5901f6d0B7A3e9c2D4F5a6b7c8D"
+        );
+        assert_eq!(
+            json["demoTarget"],
+            "0xdCec8ce0a03848B55989Bcc711e424Ca31d9eeD9"
+        );
+        assert_eq!(
+            serde_json::from_value::<AvsContracts>(json).unwrap(),
+            with_optionals
+        );
     }
 
     #[test]

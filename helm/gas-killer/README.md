@@ -131,6 +131,68 @@ fail-closes for reference blocks behind it. The whole operator set must therefor
 before any target deploys, which is what the marker between the two jobs enforces. A target
 deployed early is not repairable: its registry is immutable.
 
+### Publishing the registry before a cutover
+
+The router serves the registry address as `schnorrStakeRegistry` on `GET /avs-metadata` under
+**either** scheme. It never verifies against that address itself, it only publishes it, and a
+target's constructor is what consumes it. So publishing it while the fleet still signs BLS is what
+lets an integrator deploy a target that accepts both schemes and then needs no action from them
+when the fleet switches.
+
+The address comes from `schnorr.stakeRegistryAddress`, or failing that from what the
+`schnorr-operators` job recorded in `avs_deploy.json`. It publishes only once
+`nextPossibleMutationBlock()` answers at it, so a checker or a coordinator set here is omitted
+rather than served.
+
+Under `global.signatureScheme=bls` the `schnorr-operators` job does not render, so a registry has
+to be provisioned out of band and named in values. `SCHNORR_REGISTRY_ONLY` deploys and records one
+without registering anyone, which is what a deployment whose operator set is not yet settled needs.
+
+The binary ships in the router image, which already has `HTTP_RPC` and `PRIVATE_KEY` in its
+environment, so the router pod is the place to run it from. Both of its volumes are mounted
+read-only, though, and the binary records what it deployed back into the deployment JSON, so point
+it at a copy:
+
+```bash
+POD=$(kubectl get pod -l app.kubernetes.io/component=router -o name | head -1)
+kubectl exec "$POD" -- bash -c '
+  cp "$AVS_DEPLOYMENT_PATH" /tmp/avs_deploy.json
+  SIGNATURE_SCHEME=schnorr \
+  SCHNORR_REGISTRY_ONLY=true \
+  QUORUM_THRESHOLD=2 THRESHOLD_DENOMINATOR=3 \
+  SCHNORR_NOTICE_WINDOW=<blocks> \
+  AVS_DEPLOYMENT_PATH=/tmp/avs_deploy.json \
+  setup_schnorr_operators'
+```
+
+Then set `schnorr.stakeRegistryAddress` to the address it printed and upgrade, which is what puts
+it on `/avs-metadata`. The record it wrote into the copy is discarded with the pod, which is why
+the address goes into values by hand. Note the address before doing anything else: it is the only
+place the registry is recorded, and a second run of this command deploys a *different* registry.
+
+`SIGNATURE_SCHEME=schnorr` is on the command only because the binary is a no-op under `bls`. It is
+scoped to that process and changes nothing about the running fleet, which keeps signing BLS.
+
+Three of the registry's parameters are **fixed at deployment and cannot be changed afterwards**,
+so they have to be right on that one run:
+
+| Fixed at deployment | Comes from | Getting it wrong means |
+|---|---|---|
+| Threshold | `QUORUM_THRESHOLD` / `THRESHOLD_DENOMINATOR` | An on-chain quorum that disagrees with the router's own participation floor |
+| Notice window | `SCHNORR_NOTICE_WINDOW` | See below |
+| Owner | The key that signs the deployment, which run this way is the router's `PRIVATE_KEY`, the same one `schnorr.deployerSecretKey` defaults to | Nobody can register or deregister an operator |
+
+The chart's `schnorr.noticeWindow` default of `0` is correct only when the whole operator set is
+registered before any target deploys, which is the e2e stack's order and not this one. A registry
+that will be populated while rounds are in flight needs a window longer than a round plus
+`eigenlayer.sdk.blockStaleMeasure`, or an operator-set change can land between a round assembling
+its signature and that signature settling.
+
+The operator set itself is *not* fixed: its owner registers and deregisters through
+`announceRegister` / `announceDeregister` / `commitNextChange`. That is what makes publishing an
+empty registry safe. Every target wired to it keeps working when the set is filled later, so the
+address does not have to be republished and no integrator has to redeploy twice.
+
 ### Switching an existing deployment
 
 There is no rolling path from `bls` to `schnorr`. A mixed fleet certifies nothing, and every
@@ -149,7 +211,7 @@ orphans every target wired to the previous one. The job is otherwise install-onl
 |-----------|-------------|---------|
 | `schnorr.deployerSecretKey` | Secret key holding the funded key that deploys the registry and submits the registrations. The deployer becomes the registry owner. | `PRIVATE_KEY` |
 | `schnorr.noticeWindow` | Blocks an operator-set change must be announced ahead of taking effect. `0` applies changes immediately, correct here because the set is registered before any target deploys. | `0` |
-| `schnorr.stakeRegistryAddress` | Reuse an existing registry instead of deploying one. Its operator set is assumed complete, so no registrations are submitted. | `""` |
+| `schnorr.stakeRegistryAddress` | The registry this deployment uses. The operator-set job reuses it instead of deploying one, assuming its set is complete, so it submits no registrations; the router publishes it as `schnorrStakeRegistry` on `GET /avs-metadata` in either scheme. | `""` |
 | `schnorr.stageTimeoutSecs` | Per-stage timeout for the coordinator's rounds. Empty uses `min(5, ROUND_TIMEOUT/6)`. | `""` |
 | `schnorr.messagesPerSecond` | Per-peer rate on the schnorr channel, rendered into both the router and the nodes. The p2p sender silently drops over-rate messages, and a dropped round message costs a whole retry. Empty uses `64`. | `""` |
 

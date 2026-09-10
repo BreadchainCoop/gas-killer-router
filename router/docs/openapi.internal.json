@@ -961,6 +961,10 @@
             "$ref": "#/components/schemas/Address",
             "description": "Registry coordinator the operators are registered in. Published so an integrator can\nconfirm their own wiring independently: `blsSignatureChecker().registryCoordinator()` must\nequal this."
           },
+          "schnorrStakeRegistry": {
+            "$ref": "#/components/schemas/Address",
+            "description": "`SchnorrStakeRegistry` a target verifies aggregate Schnorr signatures against.\n\nPublished so a target can be wired to both schemes at once. A fleet signs exactly one of\nthem, fixed by its own `SIGNATURE_SCHEME`, and probes only that scheme's ERC-165 ID, so a\ntarget that accepts both settles under either without redeploying across a cutover. Absent\nwhile the deployment has provisioned no registry, which is every BLS-only one."
+          },
           "demoTarget": {
             "$ref": "#/components/schemas/Address",
             "description": "A deployed target anyone may submit against, for a first settlement with no Solidity\nwritten. Shared, so concurrent readers can invalidate each other's payloads on\n`transitionIndex`; `demoFactory` is the way to avoid that. Absent when none is configured."

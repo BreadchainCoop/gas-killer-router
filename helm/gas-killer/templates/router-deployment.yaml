@@ -400,6 +400,15 @@ spec:
             # Quorum signature scheme (bls | schnorr); must match the nodes'.
             - name: SIGNATURE_SCHEME
               value: {{ include "gas-killer.signatureScheme" . | quote }}
+            {{- with .Values.schnorr.stakeRegistryAddress }}
+            # Published as `schnorrStakeRegistry` on GET /avs-metadata. Set under either scheme,
+            # not just schnorr: the router never verifies against this address, it only publishes
+            # it, and under bls that is what lets an integrator wire a target for both schemes
+            # before the fleet switches. Left unset the router reads the registry the
+            # operator-set job recorded in avs_deploy.json.
+            - name: SCHNORR_STAKE_REGISTRY_ADDRESS
+              value: {{ . | quote }}
+            {{- end }}
             {{- if include "gas-killer.isSchnorr" . }}
             # The coordinator's participation floor. Same values the schnorr-operators job
             # fixes into the registry's on-chain threshold, keeping the two in lockstep.
