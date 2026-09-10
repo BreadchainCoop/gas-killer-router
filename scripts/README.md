@@ -181,9 +181,10 @@ Currently available:
 | `onchainLife` | bls | **`prestate-net`** | Conway's Life: heavy compute, tiny flat diff. Routable under any encoding but only settles under `prestate-net` — see below. |
 | `arraySummation` | bls | any | The default e2e target: sums selected array elements under `trackState`. |
 | `schnorrArraySummation` | schnorr | any | The same workload verified against the `SchnorrStakeRegistry`. |
+| `dualSchemeArraySummation` | either | any | The same workload on the migration-period base: one address that settles under a bls fleet and a schnorr fleet alike. |
 | `reentrantCheckpoint` | schnorr | `canonical` | Two contracts — `advance()` re-enters through an observer mid-transition. |
 
-The last three come from the Gas Killer SDK, which the examples repo vendors as a submodule;
+The last four come from the Gas Killer SDK, which the examples repo vendors as a submodule;
 `fetch_examples.sh` builds both trees and `deploy_example` searches both `out/` directories.
 
 **Schnorr examples need the operator set registered first.** That is a separate phase, because
@@ -193,6 +194,16 @@ fail-closes for reference blocks behind it:
 ```bash
 SIGNATURE_SCHEME=schnorr cargo run -p scripts --bin setup_schnorr_operators   # no-op under bls
 SIGNATURE_SCHEME=schnorr cargo run -p scripts --bin deploy_example -- --example schnorrArraySummation
+```
+
+`dualSchemeArraySummation` needs one too, and under **either** scheme, because both verifiers are
+constructor arguments: a fleet running the scheme whose verifier is unset routes to the target and
+then fails to settle against it. Under bls the registry is scaffolding the fleet never reads, so
+provisioning is enough and nobody has to be registered in it:
+
+```bash
+SCHNORR_PROVISION=registry cargo run -p scripts --bin setup_schnorr_operators
+cargo run -p scripts --bin deploy_example -- --example dualSchemeArraySummation
 ```
 
 `setup_schnorr_operators` deploys the `SchnorrStakeRegistry` and records it as

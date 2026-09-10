@@ -27,14 +27,17 @@ export SIGNATURE_SCHEME="$SIGNATURE_SCHEME_CHOICE"
 echo "Signature scheme: $SIGNATURE_SCHEME_CHOICE"
 
 # STATE_ENCODING (legacy|canonical|prestate-net), E2E_EXAMPLE
-# (array-summation|reentrant|onchain-life) and GK_SIM_PROFILE (chain|unbounded) follow the
+# (array-summation|dual-scheme|reentrant|onchain-life) and GK_SIM_PROFILE (chain|unbounded) follow
+# the
 # same capture-then-re-export discipline as SIGNATURE_SCHEME so the containers AND the
 # host-side deploy/send binaries agree. `reentrant` deploys a ReentrantCheckpoint whose
 # task re-enters mid-transition; pair it with `canonical` to prove re-entrancy is safe.
 # `onchain-life` deploys an OnchainLife and settles the multi-generation step declared in the
 # examples manifest, whose direct execution exceeds a 30M block; it requires
 # GK_SIM_PROFILE=unbounded, STATE_ENCODING=prestate-net, and
-# ANVIL_EXTRA_ARGS=--disable-block-gas-limit.
+# ANVIL_EXTRA_ARGS=--disable-block-gas-limit. `dual-scheme` deploys the migration-period base,
+# which accepts either scheme's proof, and settles it with whichever fleet is running: the same
+# target address settles under both, which is the property an integrator deploys it for.
 STATE_ENCODING_CHOICE="${STATE_ENCODING:-legacy}"
 export STATE_ENCODING="$STATE_ENCODING_CHOICE"
 E2E_EXAMPLE_CHOICE="${E2E_EXAMPLE:-array-summation}"
@@ -200,6 +203,7 @@ fi
 case "$E2E_EXAMPLE:$SIGNATURE_SCHEME" in
     array-summation:schnorr)          MANIFEST_EXAMPLE="schnorrArraySummation" ;;
     array-summation:*)                MANIFEST_EXAMPLE="arraySummation" ;;
+    dual-scheme:*|dual-scheme-array-summation:*) MANIFEST_EXAMPLE="dualSchemeArraySummation" ;;
     reentrant:*|reentrant-checkpoint:*) MANIFEST_EXAMPLE="reentrantCheckpoint" ;;
     onchain-life:*|onchainlife:*)     MANIFEST_EXAMPLE="onchainLife" ;;
     *)
@@ -207,6 +211,15 @@ case "$E2E_EXAMPLE:$SIGNATURE_SCHEME" in
         exit 1
         ;;
 esac
+
+# The dual-scheme base takes both verifiers in its constructor, so a Schnorr registry has to
+# exist even under bls, where the fleet never verifies against it. Provisioning one is what makes
+# the operator-set step below do anything under bls; without it `$deploy:schnorrStakeRegistry`
+# does not resolve and the deploy fails on an unresolvable placeholder rather than at settlement.
+if [ "$MANIFEST_EXAMPLE" = "dualSchemeArraySummation" ] && [ "$SIGNATURE_SCHEME" != "schnorr" ]; then
+    export SCHNORR_PROVISION=registry
+    echo "Provisioning a Schnorr registry (SCHNORR_PROVISION=registry) for the dual-scheme target"
+fi
 
 deploy_failed() {
     echo -e "${RED}$1${NC}"
@@ -228,8 +241,9 @@ run_from_root() {
 
 # The Schnorr operator set must be registered before any target deploys: every registration
 # advances the registry's `effectiveBlock` watermark, and verification fail-closes for reference
-# blocks behind it. A no-op under SIGNATURE_SCHEME=bls, so it runs unconditionally.
-echo "Setting up the Schnorr operator set (no-op unless SIGNATURE_SCHEME=schnorr)..."
+# blocks behind it. A no-op under bls unless SCHNORR_PROVISION asked for a registry, so it runs
+# unconditionally.
+echo "Setting up the Schnorr operator set (no-op under bls without SCHNORR_PROVISION)..."
 run_from_root --bin setup_schnorr_operators \
     || deploy_failed "Schnorr operator setup failed"
 
