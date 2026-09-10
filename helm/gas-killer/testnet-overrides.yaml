@@ -116,8 +116,11 @@ schnorr:
   # afterwards, against a live schnorr fleet.
   noticeWindow: 600
 
-  # Filled in after the first provisioning run, from the job's `recorded schnorrStakeRegistry=0x…`
-  # log line. Pinning it here is what makes the address durable: a PVC rebuilt and restored without
-  # addresses.schnorrStakeRegistry in avs_deploy.json would otherwise let rerun.schnorrOperators
-  # deploy a FRESH registry, orphaning every target already wired to this one.
-  stakeRegistryAddress: ""
+  # Deployed 2026-09-10, owner 0x5DD2e7db868e33c03daB85d0C623048A7980634E, threshold 2/3, no
+  # operator registered. Pinning it here is what makes the address durable: a PVC rebuilt and
+  # restored without addresses.schnorrStakeRegistry in avs_deploy.json would otherwise let
+  # rerun.schnorrOperators deploy a FRESH registry, orphaning every target wired to this one.
+  #
+  # Changing this value strands every integrator target whose constructor took the old address, so
+  # it moves only alongside a coordinated migration.
+  stakeRegistryAddress: "0x8A86301675ac9617895117afFE9577f5154555F9"

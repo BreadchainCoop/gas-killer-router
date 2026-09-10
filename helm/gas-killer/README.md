@@ -157,7 +157,25 @@ helm upgrade gas-killer ./helm/gas-killer --reuse-values \
 `rerun.schnorrOperators` is needed on an existing release because the job is otherwise
 install-only. On a release that has never provisioned there is no Job object to collide with, so
 this is a first run despite the flag's name. A later run needs the existing Job deleted first,
-since it is kept by resource policy and its spec is immutable.
+since it is kept by resource policy and its spec is immutable:
+
+```bash
+kubectl delete job <release>-schnorr-operators
+```
+
+That includes a run that only *corrects* something else in the same upgrade. Helm will try to
+update the existing Job, Kubernetes rejects the template change, and the whole upgrade fails with
+`spec.template: Invalid value` while leaving the rest of the release unapplied.
+
+Two things about the router bump in that command:
+
+- **The image tag carries the full 40-character commit SHA**, not an abbreviated one. The publish
+  workflow tags `router-${{ github.sha }}`, so an abbreviated SHA is simply `not found` and the
+  pod lands in `ErrImagePull`. Read the tag off the workflow run rather than composing it.
+- **The router's deployment strategy is `Recreate` with a 360s termination grace**, so any image
+  or env change drops the ingress rather than rolling it. Budget several minutes of downtime for
+  each router-affecting upgrade, and reset `rerun.schnorrOperators` to `false` afterwards so a
+  later unrelated upgrade does not trip over the kept Job.
 
 | `schnorr.provision` | Deploys and publishes | Registers the operator set |
 |---|---|---|
