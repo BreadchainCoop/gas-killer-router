@@ -94,3 +94,30 @@ deployTarget:
   arraySize: 10
   maxValue: 10000
   arraySeed: 1
+
+# Provision the SchnorrStakeRegistry while the fleet keeps signing BLS, so the router publishes its
+# address as `schnorrStakeRegistry` on GET /avs-metadata and an integrator can wire a target that
+# accepts both schemes ahead of the cutover.
+#
+# `registry` rather than `full`: this deployment's operator secp256k1 keys are gone, so nobody can
+# be registered. The registry verifies nothing until it is filled, which only matters once a fleet
+# signs schnorr, and its owner can fill it then without the address changing.
+schnorr:
+  provision: registry
+
+  # Fixed at registry deployment, immutable afterwards. Sized against the longest window a
+  # settlement can span: eigenlayer.sdk.blockStaleMeasure (300 blocks) plus router.roundTimeout
+  # (300s, ~25 blocks at a 12s slot) gives a 325-block floor, so 600 leaves ~1.85x margin.
+  #
+  # Deliberately not the chart's default of 0. At 0 even announceRegister is committable in the
+  # same block, so the announce path would give no protection at all. The window costs nothing at
+  # the cutover itself: the operator set is registered through the immediate path while the fleet
+  # still signs BLS, so no schnorr round exists to invalidate. What it protects is operator churn
+  # afterwards, against a live schnorr fleet.
+  noticeWindow: 600
+
+  # Filled in after the first provisioning run, from the job's `recorded schnorrStakeRegistry=0x…`
+  # log line. Pinning it here is what makes the address durable: a PVC rebuilt and restored without
+  # addresses.schnorrStakeRegistry in avs_deploy.json would otherwise let rerun.schnorrOperators
+  # deploy a FRESH registry, orphaning every target already wired to this one.
+  stakeRegistryAddress: ""
