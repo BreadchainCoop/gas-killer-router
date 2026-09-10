@@ -30,6 +30,10 @@ jobs:
         #   - the aggregate-Schnorr path under the CANONICAL encoding settling a task that
         #     makes a re-entrant external call mid-transition — a green run proves
         #     re-entrancy settles safely end-to-end.
+        #   - both paths against the migration-period dual-scheme base, which is the one target
+        #     that has to settle under either fleet: the bls leg is what an integrator deploys
+        #     against today, and the schnorr leg is the cutover, exercising a different router
+        #     path and a different ERC-165 ID against the same contract
         #   - the BLS path under the PRESTATE-NET encoding, which signs the target's net
         #     storage diff read from prestateTracer/callTracer rather than a struct-log
         #     trace. `ArraySummation.sum` makes no external call at target depth, so this
@@ -53,6 +57,12 @@ jobs:
           - signature_scheme: bls
             state_encoding: prestate-net
             e2e_example: array-summation
+          - signature_scheme: bls
+            state_encoding: prestate-net
+            e2e_example: dual-scheme
+          - signature_scheme: schnorr
+            state_encoding: prestate-net
+            e2e_example: dual-scheme
           - signature_scheme: bls
             state_encoding: prestate-net
             e2e_example: onchain-life

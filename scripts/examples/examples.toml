@@ -229,6 +229,27 @@ ctor_args = ["$avs", "$deploy:schnorrStakeRegistry", "100", "1000", "42"]
   sig   = "sum(uint256[])"
   args  = [["0", "1", "2"]]
 
+# ── DualSchemeArraySummation ─────────────────────────────────────────────────────────────
+# The same workload on the migration-period base, which reports both schemes' ERC-165 IDs and
+# accepts either proof. One deployed address settles against a bls fleet and a schnorr fleet
+# alike, so it is the target an integrator deploys ahead of a scheme cutover.
+#
+# Both verifiers are constructor arguments: a fleet running the scheme whose verifier is unset
+# routes to the target and then fails to settle against it. `$deploy:schnorrStakeRegistry`
+# therefore has to resolve even under bls, which means `setup_schnorr_operators` must have
+# provisioned a registry (SCHNORR_PROVISION=registry) rather than no-opped.
+[[examples]]
+name      = "dualSchemeArraySummation"
+alias     = "gasKillerTarget"
+artifact  = "DualSchemeArraySummation.sol:DualSchemeArraySummation"
+# (avs, blsSigChecker, schnorrStakeRegistry, arraySize, maxValue, seed)
+ctor_args = ["$avs", "$sigChecker", "$deploy:schnorrStakeRegistry", "100", "1000", "42"]
+
+  [[examples.exercise]]
+  label = "dual_scheme_array_summation_sum"
+  sig   = "sum(uint256[])"
+  args  = [["0", "1", "2"]]
+
 # ── ReentrantCheckpoint + ReentrantObserver ──────────────────────────────────────────────
 # Two contracts: `advance()` re-enters the checkpoint through the observer mid-transition, so
 # settling it proves re-entrancy is safe under STATE_ENCODING=canonical. The observer is a plain
