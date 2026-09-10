@@ -197,11 +197,12 @@ SIGNATURE_SCHEME=schnorr cargo run -p scripts --bin deploy_example -- --example 
 
 `setup_schnorr_operators` deploys the `SchnorrStakeRegistry` and records it as
 `addresses.schnorrStakeRegistry`, which the manifest resolves via `$deploy:schnorrStakeRegistry`.
-`SCHNORR_REGISTRY_ONLY=true` deploys and records the registry without registering anyone, for a
-deployment that wants the address published before it has an operator set to put in it. The
-router serves it as `schnorrStakeRegistry` on `GET /avs-metadata` under either scheme, and a
-target's constructor takes it. The registry verifies nothing until operators are registered, which
-its owner can do later.
+`SCHNORR_PROVISION` selects which phases run, independent of `SIGNATURE_SCHEME`: unset follows the
+scheme, `registry` deploys and records the registry and registers nobody, `full` also registers.
+`registry` is for a deployment that wants the address published before it has an operator set to
+put in it. The router serves it as `schnorrStakeRegistry` on `GET /avs-metadata` under either
+scheme, and a target's constructor takes it. The registry verifies nothing until operators are
+registered, which its owner can do later into the same registry.
 
 **`onchainLife` requires `STATE_ENCODING=prestate-net`.**
 

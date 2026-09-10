@@ -24,7 +24,7 @@ spec:
       serviceAccountName: {{ default (include "gas-killer.serviceaccount.fullname" .) .Values.secretManager.serviceAccountName }}
       initContainers:
         # Wait for every job that writes to the shared volume before exporting it: the setup job
-        # (operator keys), generate-router-key, and under schnorr the operator-set job.
+        # (operator keys), generate-router-key, and the operator-set job where one runs.
         - name: wait-for-setup
           image: busybox:1.36
           command:
@@ -34,7 +34,7 @@ spec:
               echo "Waiting for setup and router key generation (timeout: {{ .Values.global.initTimeout }}s)..."
               TIMEOUT={{ .Values.global.initTimeout }}
               ELAPSED=0
-              {{- if include "gas-killer.isSchnorr" . }}
+              {{- if include "gas-killer.provisionsSchnorrRegistry" . }}
               # schnorr-operators writes the registry address into avs_deploy.json after setup
               # completes. Exporting before that lands backs up a copy with no
               # addresses.schnorrStakeRegistry, and restoring it would make the job's idempotency

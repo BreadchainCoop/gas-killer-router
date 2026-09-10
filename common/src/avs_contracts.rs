@@ -24,8 +24,9 @@
 //! - The two are then cross-checked: the checker's own `registryCoordinator()` must be the
 //!   coordinator the operators are registered in. A mismatch means the reference target belongs to
 //!   a superseded deployment, so nothing is published rather than publishing a pair that reverts.
-//! - `schnorrStakeRegistry` comes from `SCHNORR_STAKE_REGISTRY_ADDRESS`, or failing that from
-//!   `avs_deploy.json`, and publishes only once a registry answers at it. A target's registry is
+//! - `schnorrStakeRegistry` comes from `SCHNORR_STAKE_REGISTRY_ADDRESS`, or failing that from the
+//!   record the operator-set job writes, or failing that from `avs_deploy.json`, and publishes
+//!   only once a registry answers at it. A target's registry is
 //!   fixed by its constructor, so a wrong one settles BLS rounds today and can never settle a
 //!   Schnorr round: a mistake that surfaces at a scheme cutover, long after it was made.
 //! - `demoTarget` and `demoFactory` come from configuration or, failing that, from what the
@@ -79,6 +80,16 @@ const DEMO_TARGET_FILE_ENV: &str = "DEMO_TARGET_FILE";
 /// Names the file recording the playground `ArraySummationFactory`, from which a reader deploys a
 /// target only they are advancing.
 const DEMO_FACTORY_FILE_ENV: &str = "DEMO_FACTORY_FILE";
+
+/// Names the file recording the Schnorr stake registry the operator-set job deployed.
+///
+/// Set for the same reason as [`REFERENCE_TARGET_FILE_ENV`], and more sharply: the job records the
+/// address into `avs_deploy.json` on the shared volume, but under Secret Manager the router reads
+/// its own copy of that file from a secrets volume the job never touches, so the recorded value
+/// would not reach it until the export job re-ran. The record is on the volume the router already
+/// mounts, and being a named record makes it retried while unwritten rather than read once at
+/// startup, so a job that finishes after the router is serving still lands.
+const SCHNORR_STAKE_REGISTRY_FILE_ENV: &str = "SCHNORR_STAKE_REGISTRY_FILE";
 
 /// Key the AVS deployment JSON records the Schnorr stake registry under.
 ///
@@ -260,9 +271,11 @@ pub struct ContractsConfig {
     pub demo_factory: Option<Address>,
     /// [`DEMO_FACTORY_FILE_ENV`]: file the playground job records its factory in.
     pub demo_factory_file: Option<PathBuf>,
-    /// `SCHNORR_STAKE_REGISTRY_ADDRESS`: overrides the registry the AVS deployment JSON records,
-    /// for a deployment whose registry was provisioned outside the chart's job.
+    /// `SCHNORR_STAKE_REGISTRY_ADDRESS`: overrides both sources below, for a deployment whose
+    /// registry was provisioned outside the chart's job.
     pub schnorr_stake_registry: Option<Address>,
+    /// [`SCHNORR_STAKE_REGISTRY_FILE_ENV`]: file the operator-set job records its registry in.
+    pub schnorr_stake_registry_file: Option<PathBuf>,
 }
 
 impl ContractsConfig {
@@ -282,6 +295,8 @@ impl ContractsConfig {
             demo_factory: lenient_address_from_env("DEMO_FACTORY_ADDRESS"),
             demo_factory_file: non_empty_env(DEMO_FACTORY_FILE_ENV).map(PathBuf::from),
             schnorr_stake_registry: lenient_address_from_env("SCHNORR_STAKE_REGISTRY_ADDRESS"),
+            schnorr_stake_registry_file: non_empty_env(SCHNORR_STAKE_REGISTRY_FILE_ENV)
+                .map(PathBuf::from),
         })
     }
 }
@@ -516,9 +531,11 @@ pub struct Resolution {
 /// [`Resolution::incomplete`] set so the caller tries again, having published whatever else stands.
 ///
 /// `deployment_schnorr_registry` is what the AVS deployment JSON records under
-/// [`SCHNORR_STAKE_REGISTRY_KEY`], read by the caller because it owns the parser for that file.
-/// `SCHNORR_STAKE_REGISTRY_ADDRESS` wins over it, so a registry provisioned outside the chart's job
-/// can be published without editing the deployment file the operators' jobs own.
+/// [`SCHNORR_STAKE_REGISTRY_KEY`], read by the caller because it owns the parser for that file. It
+/// is the last of three sources: `SCHNORR_STAKE_REGISTRY_ADDRESS` wins, then the record named by
+/// [`SCHNORR_STAKE_REGISTRY_FILE_ENV`], then this. The order is what lets a registry provisioned
+/// outside the chart's job be published without editing the deployment file the jobs own, and lets
+/// the job's own record beat a stale copy of that file.
 pub async fn resolve<P: Provider>(
     provider: &P,
     registry_coordinator: Address,
@@ -578,14 +595,16 @@ pub async fn resolve<P: Provider>(
         config.demo_factory_file.as_deref(),
         &mut records,
     );
-    let schnorr_stake_registry = registry_on_chain(
-        provider,
-        config
-            .schnorr_stake_registry
-            .or(deployment_schnorr_registry),
+    // The job's record wins over the deployment file, since the two disagree only while the
+    // router is reading a copy of `avs_deploy.json` that predates the job.
+    let recorded_registry = configured_or_recorded(
+        config.schnorr_stake_registry,
+        config.schnorr_stake_registry_file.as_deref(),
         &mut records,
     )
-    .await?;
+    .or(deployment_schnorr_registry);
+    let schnorr_stake_registry =
+        registry_on_chain(provider, recorded_registry, &mut records).await?;
 
     Ok(Resolution {
         contracts: Some(AvsContracts {
@@ -1216,6 +1235,82 @@ mod tests {
         assert!(
             resolution.incomplete,
             "a registry recorded before it was deployed shows up on a later attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn publishes_the_registry_the_operator_set_job_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = write(
+            dir.path(),
+            "schnorr_stake_registry.txt",
+            &format!("{REGISTRY:?}\n"),
+        );
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+        push_registry(&asserter);
+
+        let config = ContractsConfig {
+            schnorr_stake_registry_file: Some(record),
+            ..pinned(None)
+        };
+        // A deployment file predating the job is what the record exists to beat.
+        let resolution = resolve_with_recorded_registry(&provider, None, &config).await;
+
+        let contracts = resolution.contracts.expect("the pair still publishes");
+        assert_eq!(contracts.schnorr_stake_registry, Some(REGISTRY));
+        assert!(!resolution.incomplete);
+    }
+
+    #[tokio::test]
+    async fn the_job_record_wins_over_the_deployment_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = write(
+            dir.path(),
+            "schnorr_stake_registry.txt",
+            &format!("{REGISTRY:?}"),
+        );
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+        push_registry(&asserter);
+
+        let config = ContractsConfig {
+            schnorr_stake_registry_file: Some(record),
+            ..pinned(None)
+        };
+        let contracts = resolve_with_recorded_registry(&provider, Some(OTHER_REGISTRY), &config)
+            .await
+            .contracts
+            .expect("the pair still publishes");
+
+        assert_eq!(
+            contracts.schnorr_stake_registry,
+            Some(REGISTRY),
+            "the two disagree only while the deployment file the router reads predates the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwritten_registry_record_falls_back_and_asks_to_be_retried() {
+        let (provider, asserter) = mock_provider();
+        push_wiring(&asserter, COORDINATOR);
+        push_registry(&asserter);
+
+        let config = ContractsConfig {
+            schnorr_stake_registry_file: Some(unwritten("schnorr_stake_registry.txt")),
+            ..pinned(None)
+        };
+        let resolution = resolve_with_recorded_registry(&provider, Some(REGISTRY), &config).await;
+
+        let contracts = resolution.contracts.expect("the pair still publishes");
+        assert_eq!(
+            contracts.schnorr_stake_registry,
+            Some(REGISTRY),
+            "a job that has not finished must not withhold what the deployment file already names"
+        );
+        assert!(
+            resolution.incomplete,
+            "and the record it will write is still coming, so keep re-establishing the set"
         );
     }
 

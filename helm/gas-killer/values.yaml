@@ -148,11 +148,12 @@ rerun:
   # reader may be part-way through advancing. The job is otherwise install-only, and skips any
   # contract it already recorded that still has code on chain.
   playground: false
-  # Re-run the schnorr operator-set job (global.signatureScheme=schnorr only). Only set this
+  # Re-run the schnorr operator-set job. Also what renders it for the first time on a release
+  # that newly sets schnorr.provision, since the job is otherwise install-only. Only set this
   # deliberately: without schnorr.stakeRegistryAddress the job deploys a FRESH
   # SchnorrStakeRegistry and re-registers every operator, which orphans every target already
-  # wired to the old one. The job is otherwise install-only, and skips when avs_deploy.json
-  # already records a registry address.
+  # wired to the old one. It skips when avs_deploy.json already records a registry address, so
+  # that record is the guard.
   schnorrOperators: false
   # Re-run the generate-router-key job (TESTNET+secretManager only).
   # Only set this if you intentionally want to rotate the router BLS keypair —
@@ -598,17 +599,36 @@ bridge:
 # The registry and the operator-set registration come from the schnorr-operators job, which runs
 # on install between setup and deploy-target.
 schnorr:
+  # Provision the Schnorr scaffolding while the fleet signs another scheme, so a target can be
+  # wired for both before a cutover. Ignored under global.signatureScheme=schnorr, where the
+  # operator-set job always runs and always registers.
+  #
+  #   ""          nothing
+  #   "registry"  deploy the registry and publish its address; register nobody
+  #   "full"      also register the operator set
+  #
+  # "registry" is what a deployment whose operator secp256k1 keys are gone can still do: the
+  # address is what a target's constructor takes, and the registry verifies nothing until it is
+  # filled, which only matters once a fleet signs schnorr. Its owner can fill it later, so the
+  # published address does not have to change and no integrator redeploys twice.
+  #
+  # "full" needs every operator's secp256k1 key on the shared volume, and makes the restore of
+  # those keys fatal in the setup job.
+  provision: ""
+
   # Secret key (in the app secret) holding the funded key that deploys the registry and submits
   # the registrations: PRIVATE_KEY or FUNDED_KEY. The deployer becomes the registry's owner.
   deployerSecretKey: PRIVATE_KEY
 
-  # Blocks a registry operator-set change must be announced ahead of taking effect. The router
-  # ends a rendered payload's validity before the horizon this publishes, so a settlement is
-  # never assembled against one operator set and verified against another.
+  # Blocks a registry operator-set change must be announced ahead of taking effect. Fixed at
+  # registry deployment and immutable afterwards. The router ends a rendered payload's validity
+  # before the horizon this publishes, so a settlement is never assembled against one operator set
+  # and verified against another.
   #
-  # 0 applies changes as soon as they are committed, correct here because the whole operator set
-  # is registered before any target deploys. A deployment that mutates its set while rounds are
-  # in flight must exceed the round duration plus eigenlayer.sdk.blockStaleMeasure.
+  # 0 applies changes as soon as they are committed, correct only when the whole operator set is
+  # registered before any target deploys. A deployment that will fill or mutate its set while
+  # rounds are in flight must exceed the round duration plus eigenlayer.sdk.blockStaleMeasure,
+  # which includes anything provisioned with provision="registry" and registered later.
   noticeWindow: 0
 
   # The SchnorrStakeRegistry this deployment uses, read by two things:

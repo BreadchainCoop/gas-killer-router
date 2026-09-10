@@ -144,49 +144,56 @@ The address comes from `schnorr.stakeRegistryAddress`, or failing that from what
 `nextPossibleMutationBlock()` answers at it, so a checker or a coordinator set here is omitted
 rather than served.
 
-Under `global.signatureScheme=bls` the `schnorr-operators` job does not render, so a registry has
-to be provisioned out of band and named in values. `SCHNORR_REGISTRY_ONLY` deploys and records one
-without registering anyone, which is what a deployment whose operator set is not yet settled needs.
-
-The binary ships in the router image, which already has `HTTP_RPC` and `PRIVATE_KEY` in its
-environment, so the router pod is the place to run it from. Both of its volumes are mounted
-read-only, though, and the binary records what it deployed back into the deployment JSON, so point
-it at a copy:
+`schnorr.provision` renders the `schnorr-operators` job under any scheme, so the cluster
+provisions the registry itself:
 
 ```bash
-POD=$(kubectl get pod -l app.kubernetes.io/component=router -o name | head -1)
-kubectl exec "$POD" -- bash -c '
-  cp "$AVS_DEPLOYMENT_PATH" /tmp/avs_deploy.json
-  SIGNATURE_SCHEME=schnorr \
-  SCHNORR_REGISTRY_ONLY=true \
-  QUORUM_THRESHOLD=2 THRESHOLD_DENOMINATOR=3 \
-  SCHNORR_NOTICE_WINDOW=<blocks> \
-  AVS_DEPLOYMENT_PATH=/tmp/avs_deploy.json \
-  setup_schnorr_operators'
+helm upgrade gas-killer ./helm/gas-killer --reuse-values \
+  --set schnorr.provision=registry \
+  --set schnorr.noticeWindow=<blocks> \
+  --set rerun.schnorrOperators=true
 ```
 
-Then set `schnorr.stakeRegistryAddress` to the address it printed and upgrade, which is what puts
-it on `/avs-metadata`. The record it wrote into the copy is discarded with the pod, which is why
-the address goes into values by hand. Note the address before doing anything else: it is the only
-place the registry is recorded, and a second run of this command deploys a *different* registry.
+`rerun.schnorrOperators` is needed on an existing release because the job is otherwise
+install-only. On a release that has never provisioned there is no Job object to collide with, so
+this is a first run despite the flag's name. A later run needs the existing Job deleted first,
+since it is kept by resource policy and its spec is immutable.
 
-`SIGNATURE_SCHEME=schnorr` is on the command only because the binary is a no-op under `bls`. It is
-scoped to that process and changes nothing about the running fleet, which keeps signing BLS.
+| `schnorr.provision` | Deploys and publishes | Registers the operator set |
+|---|---|---|
+| `""` (default) | no | no |
+| `registry` | yes | no |
+| `full` | yes | yes |
+
+`registry` is what a deployment whose operator secp256k1 keys are gone can still do. `full` needs
+every operator's key on the shared volume, and makes the restore of those keys fatal in the setup
+job. Under `global.signatureScheme=schnorr` the value is ignored: the job always runs and always
+registers, since a Schnorr fleet certifies nothing against an empty registry.
+
+Nothing about the running fleet changes either way. It keeps signing BLS, `deploy-target` keeps
+deploying a BLS target, and the job's only effect on the deployment is the address it publishes.
+
+The job writes the address to `/app/.nodes/schnorr_stake_registry.txt`, and the router reads it
+from there as a named record rather than from `avs_deploy.json`, because under Secret Manager the
+router's copy of that file comes from a secrets volume the job never writes to. Being a record
+also means it is retried while unwritten, so a job that finishes after the router is serving still
+lands without a restart. `schnorr.stakeRegistryAddress` overrides it, for a registry provisioned
+outside the chart entirely.
 
 Three of the registry's parameters are **fixed at deployment and cannot be changed afterwards**,
-so they have to be right on that one run:
+so they have to be right on the run that deploys it:
 
 | Fixed at deployment | Comes from | Getting it wrong means |
 |---|---|---|
-| Threshold | `QUORUM_THRESHOLD` / `THRESHOLD_DENOMINATOR` | An on-chain quorum that disagrees with the router's own participation floor |
-| Notice window | `SCHNORR_NOTICE_WINDOW` | See below |
-| Owner | The key that signs the deployment, which run this way is the router's `PRIVATE_KEY`, the same one `schnorr.deployerSecretKey` defaults to | Nobody can register or deregister an operator |
+| Threshold | `eigenlayer.sdk.quorumThreshold` / `.thresholdDenominator` | An on-chain quorum that disagrees with the router's own participation floor |
+| Notice window | `schnorr.noticeWindow` | See below |
+| Owner | `schnorr.deployerSecretKey` | Nobody can register or deregister an operator |
 
-The chart's `schnorr.noticeWindow` default of `0` is correct only when the whole operator set is
-registered before any target deploys, which is the e2e stack's order and not this one. A registry
-that will be populated while rounds are in flight needs a window longer than a round plus
-`eigenlayer.sdk.blockStaleMeasure`, or an operator-set change can land between a round assembling
-its signature and that signature settling.
+The `schnorr.noticeWindow` default of `0` is correct only when the whole operator set is registered
+before any target deploys, which is the e2e stack's order and **not** `provision=registry`'s. A
+registry that will be filled or mutated while rounds are in flight needs a window longer than a
+round plus `eigenlayer.sdk.blockStaleMeasure`, or an operator-set change can land between a round
+assembling its signature and that signature settling.
 
 The operator set itself is *not* fixed: its owner registers and deregisters through
 `announceRegister` / `announceDeregister` / `commitNextChange`. That is what makes publishing an
@@ -210,7 +217,8 @@ orphans every target wired to the previous one. The job is otherwise install-onl
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `schnorr.deployerSecretKey` | Secret key holding the funded key that deploys the registry and submits the registrations. The deployer becomes the registry owner. | `PRIVATE_KEY` |
-| `schnorr.noticeWindow` | Blocks an operator-set change must be announced ahead of taking effect. `0` applies changes immediately, correct here because the set is registered before any target deploys. | `0` |
+| `schnorr.provision` | Provision the Schnorr scaffolding while the fleet signs another scheme: `""`, `registry` or `full`. Ignored under `signatureScheme=schnorr`. | `""` |
+| `schnorr.noticeWindow` | Blocks an operator-set change must be announced ahead of taking effect, fixed at registry deployment. `0` applies changes immediately, correct only when the set is registered before any target deploys. | `0` |
 | `schnorr.stakeRegistryAddress` | The registry this deployment uses. The operator-set job reuses it instead of deploying one, assuming its set is complete, so it submits no registrations; the router publishes it as `schnorrStakeRegistry` on `GET /avs-metadata` in either scheme. | `""` |
 | `schnorr.stageTimeoutSecs` | Per-stage timeout for the coordinator's rounds. Empty uses `min(5, ROUND_TIMEOUT/6)`. | `""` |
 | `schnorr.messagesPerSecond` | Per-peer rate on the schnorr channel, rendered into both the router and the nodes. The p2p sender silently drops over-rate messages, and a dropped round message costs a whole retry. Empty uses `64`. | `""` |
