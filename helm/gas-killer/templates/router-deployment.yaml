@@ -404,10 +404,18 @@ spec:
             # Published as `schnorrStakeRegistry` on GET /avs-metadata. Set under either scheme,
             # not just schnorr: the router never verifies against this address, it only publishes
             # it, and under bls that is what lets an integrator wire a target for both schemes
-            # before the fleet switches. Left unset the router reads the registry the
-            # operator-set job recorded in avs_deploy.json.
+            # before the fleet switches.
             - name: SCHNORR_STAKE_REGISTRY_ADDRESS
               value: {{ . | quote }}
+            {{- end }}
+            {{- if include "gas-killer.provisionsSchnorrRegistry" . }}
+            # Where the operator-set job records what it deployed, read as a named record so a job
+            # that finishes after the router is serving still lands. Set only when a job is
+            # expected to write it: an unwritten record keeps the resolver retrying, and a
+            # deployment provisioning no registry must not retry forever over one it will never
+            # have.
+            - name: SCHNORR_STAKE_REGISTRY_FILE
+              value: {{ include "gas-killer.schnorrRegistryRecord" . | quote }}
             {{- end }}
             {{- if include "gas-killer.isSchnorr" . }}
             # The coordinator's participation floor. Same values the schnorr-operators job

@@ -156,6 +156,18 @@ jobs:
             L2_FEATURES=true
           fi
 
+          # The bls leg also provisions the Schnorr registry, which is what a deployment does
+          # while it waits for a cutover: the fleet keeps signing bls and settling against a bls
+          # target, and the registry address is published for integrators to wire. "full" rather
+          # than "registry" because this cluster's operator keys exist, so the registration path
+          # is exercised here rather than first on the day it matters. Left empty under schnorr,
+          # where the job always runs and always registers.
+          if [ "$SIGNATURE_SCHEME" = "schnorr" ]; then
+            SCHNORR_PROVISION=""
+          else
+            SCHNORR_PROVISION="full"
+          fi
+
           # Install without --wait to avoid circular dependency
           # (pods wait for setup job, setup job is post-install hook)
           helm install gas-killer ./helm/gas-killer \
@@ -179,6 +191,7 @@ jobs:
             --set router.image.pullPolicy=Never \
             --set sharedData.storageClass="" \
             --set global.signatureScheme="$SIGNATURE_SCHEME" \
+            --set schnorr.provision="$SCHNORR_PROVISION" \
             --set l2.enabled=$L2_FEATURES \
             --set bridge.enabled=$L2_FEATURES \
             --set bridge.waitForBridge=$L2_FEATURES \
@@ -215,14 +228,13 @@ jobs:
           kubectl logs "$SETUP_JOB" --tail=30
 
       - name: Wait for schnorr operator-set job to complete
-        if: matrix.signature_scheme == 'schnorr'
         run: |
           echo "Waiting for the schnorr operator-set job..."
 
           SCHNORR_JOB=$(kubectl get jobs -o name | grep schnorr-operators | head -1)
 
           if [ -z "$SCHNORR_JOB" ]; then
-            echo "schnorr-operators job not found, but global.signatureScheme=schnorr"
+            echo "schnorr-operators job not found; both legs provision a registry, so it should"
             kubectl get jobs
             exit 1
           fi

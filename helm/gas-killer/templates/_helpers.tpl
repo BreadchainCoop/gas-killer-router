@@ -215,6 +215,68 @@ crash-loop the whole fleet.
 {{- end }}
 
 {{/*
+What Schnorr scaffolding to provision while the fleet signs another scheme, from
+schnorr.provision: "" (nothing), "registry" (deploy the registry and publish its address), or
+"full" (also register the operator set).
+
+Ignored under signatureScheme=schnorr, where the operator-set job always runs and always
+registers: a schnorr fleet certifies nothing against an empty registry, so there is no useful
+half-provisioned state to select.
+
+Rejects an unrecognized value here rather than letting it reach the pods, matching
+gas-killer.signatureScheme: setup_schnorr_operators errors on anything else, so a typo would
+otherwise install cleanly and then fail a job.
+*/}}
+{{- define "gas-killer.schnorrProvision" -}}
+{{- $provision := .Values.schnorr.provision | default "" | trim | lower -}}
+{{- if not (has $provision (list "" "registry" "full")) -}}
+{{- fail (printf "schnorr.provision must be \"\", \"registry\" or \"full\", got %q" .Values.schnorr.provision) -}}
+{{- end -}}
+{{- $provision -}}
+{{- end }}
+
+{{/*
+Whether this deployment provisions a SchnorrStakeRegistry at all, which is what gates the
+operator-set job and the handoff of its address to the router. Emits "true" or "".
+*/}}
+{{- define "gas-killer.provisionsSchnorrRegistry" -}}
+{{- if or (include "gas-killer.isSchnorr" .) (include "gas-killer.schnorrProvision" .) -}}true{{- end }}
+{{- end }}
+
+{{/*
+Whether the operator set is registered against that registry. Emits "true" or "".
+
+Separate from provisioning because registering needs every operator's secp256k1 key on the shared
+volume, and a deployment whose keys are gone can still deploy and publish a registry for
+integrators to wire against, filling it later. The registry verifies nothing until it is filled,
+which only matters once a fleet signs schnorr.
+*/}}
+{{- define "gas-killer.registersSchnorrOperators" -}}
+{{- if or (include "gas-killer.isSchnorr" .) (eq (include "gas-killer.schnorrProvision" .) "full") -}}true{{- end }}
+{{- end }}
+
+{{/*
+The SCHNORR_PROVISION value the operator-set job runs with: "full" where the operator set is
+registered, "registry" where only the registry is deployed.
+
+Derived from the chart's own two decisions rather than passed through from schnorr.provision, so
+the binary and the templates cannot disagree. Under signatureScheme=schnorr that means "full"
+whatever schnorr.provision says, which is what the templates already gate on. Only meaningful
+where gas-killer.provisionsSchnorrRegistry holds.
+*/}}
+{{- define "gas-killer.schnorrProvisionMode" -}}
+{{- if include "gas-killer.registersSchnorrOperators" . -}}full{{- else -}}registry{{- end }}
+{{- end }}
+
+{{/*
+Path the operator-set job records its registry address at, on the shared volume. The router reads
+it from there as a named record, so a job that finishes after the router is serving still lands.
+*/}}
+{{- define "gas-killer.schnorrRegistryRecord" -}}
+/app/.nodes/schnorr_stake_registry.txt
+{{- end }}
+
+{{/*
 The quorum signature scheme (SIGNATURE_SCHEME) shared by the router and every node. Both
 deployments render this one helper, so they cannot be given different values. A mixed fleet
 signs with two incompatible schemes and certifies nothing.

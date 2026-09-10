@@ -1,17 +1,20 @@
 {{- /*
 Schnorr operator-set job: deploys the SchnorrStakeRegistry and registers every operator's
 secp256k1 key against it with a proof of possession, then records the registry address under
-`addresses.schnorrStakeRegistry` in avs_deploy.json.
+`addresses.schnorrStakeRegistry` in avs_deploy.json and at the record the router reads.
 
-Renders only under global.signatureScheme=schnorr; the BLS stack verifies against a
-BLSSignatureChecker from the EigenLayer deployment and needs none of this.
+Renders under global.signatureScheme=schnorr, and under any scheme when schnorr.provision is
+set. That second case is scaffolding: the BLS stack verifies against a BLSSignatureChecker and
+needs none of this, but a target's constructor takes the registry address, so publishing one
+while the fleet still signs BLS is what lets an integrator wire a target for both schemes and
+then need no action when the fleet switches.
 
 Ordering is load-bearing. Every registration advances the registry's effectiveBlock watermark
 and verification fail-closes for reference blocks behind it, so the whole operator set must be
 registered before any target contract deploys. The deploy-target job waits on the marker this
 job writes.
 */ -}}
-{{- if include "gas-killer.isSchnorr" . }}
+{{- if include "gas-killer.provisionsSchnorrRegistry" . }}
 {{- if or .Release.IsInstall .Values.rerun.schnorrOperators }}
 apiVersion: batch/v1
 kind: Job
@@ -58,6 +61,7 @@ spec:
                 sleep 10; ELAPSED=$((ELAPSED + 10))
               done
 
+              {{- if include "gas-killer.registersSchnorrOperators" . }}
               # The operators' Schnorr keys ARE their secp256k1 keys. Checked here so a volume
               # missing them fails with the reason rather than inside the registration loop.
               {{- $nodeCount := int .Values.global.nodeCount }}
@@ -71,6 +75,11 @@ spec:
               fi
               {{- end }}
               echo "Setup complete and all {{ .Values.global.nodeCount }} operator keys present."
+              {{- else }}
+              # No key check: this run registers nobody, so it needs the AVS address and a funded
+              # deployer and nothing else.
+              echo "Setup complete. Deploying the registry without registering an operator set."
+              {{- end }}
           volumeMounts:
             - name: shared-data
               mountPath: /app/.nodes
@@ -90,19 +99,43 @@ spec:
               set -euo pipefail
               AVS_JSON=/app/.nodes/avs_deploy.json
               MARKER=/app/.nodes/.schnorr_operators_complete
+              RECORD={{ include "gas-killer.schnorrRegistryRecord" . }}
+
+              # The address the binary recorded in the deployment JSON, or empty.
+              registry_address() {
+                grep -o '"schnorrStakeRegistry"[[:space:]]*:[[:space:]]*"0x[0-9a-fA-F]*"' "$AVS_JSON" \
+                  | head -1 | grep -o '0x[0-9a-fA-F]*' || true
+              }
+
+              # Copy the address to its own file for the router to read. Needed because the router
+              # does not read this deployment JSON on every deployment: under Secret Manager its
+              # copy comes from a secrets volume this job never writes to, so the address would not
+              # reach it until the export job re-ran. Written before the marker, which is what the
+              # export job waits on.
+              publish_record() {
+                local addr
+                addr=$(registry_address)
+                if [ -z "$addr" ]; then
+                  echo "ERROR: no schnorrStakeRegistry in $AVS_JSON to record" >&2
+                  return 1
+                fi
+                printf '%s' "$addr" > "$RECORD"
+                chmod 644 "$RECORD"
+                echo "[schnorr-operators] recorded schnorrStakeRegistry=$addr at $RECORD"
+              }
 
               # Without SCHNORR_STAKE_REGISTRY_ADDRESS a second run deploys a FRESH registry and
               # re-registers everyone, orphaning every target wired to the old one. Recording the
               # address is the binary's last step, so its presence means the phase succeeded.
-              EXISTING=$(grep -o '"schnorrStakeRegistry"[[:space:]]*:[[:space:]]*"0x[0-9a-fA-F]*"' "$AVS_JSON" \
-                | head -1 | grep -o '0x[0-9a-fA-F]*' || true)
+              EXISTING=$(registry_address)
               if [ -n "$EXISTING" ]; then
                 echo "[schnorr-operators] avs_deploy.json already records schnorrStakeRegistry=$EXISTING; skipping"
+                publish_record
                 touch "$MARKER"; chmod 644 "$MARKER"
                 exit 0
               fi
 
-              echo "[schnorr-operators] deploying SchnorrStakeRegistry and registering the operator set"
+              echo "[schnorr-operators] deploying SchnorrStakeRegistry"
               setup_schnorr_operators
 
               # Re-read rather than trust the exit code: the marker gates the deploy-target job.
@@ -114,11 +147,18 @@ spec:
               # Keep the deployment JSON readable by the non-root node and router containers,
               # which the binary's rewrite would otherwise not preserve.
               chmod 644 "$AVS_JSON"
+              publish_record
               touch "$MARKER"; chmod 644 "$MARKER"
-              echo "[schnorr-operators] operator set ready"
+              echo "[schnorr-operators] registry ready"
           env:
             - name: SIGNATURE_SCHEME
               value: {{ include "gas-killer.signatureScheme" . | quote }}
+            # Which phases run, stated rather than derived from SIGNATURE_SCHEME: this job runs
+            # under schemes that verify nothing against the registry, and the key check above is
+            # gated on the same decision, so the two cannot disagree about whether operators are
+            # registered.
+            - name: SCHNORR_PROVISION
+              value: {{ include "gas-killer.schnorrProvisionMode" . | quote }}
             - name: AVS_DEPLOYMENT_PATH
               value: "/app/.nodes/avs_deploy.json"
             - name: HTTP_RPC

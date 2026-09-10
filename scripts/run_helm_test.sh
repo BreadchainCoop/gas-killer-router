@@ -206,17 +206,17 @@ kubectl wait --for=condition=complete "$SETUP_JOB" --timeout=500s
 echo "Setup job completed:"
 kubectl logs "$SETUP_JOB" --tail=20
 
-# The chart deploys the SchnorrStakeRegistry and registers the operator set in its own job under
-# schnorr. Waited on here because step 9 copies the deployment JSON the job writes the registry
-# address into.
-if [ "$SIGNATURE_SCHEME" = "schnorr" ]; then
+# The chart deploys the SchnorrStakeRegistry in its own job, always under schnorr and under any
+# scheme when schnorr.provision is set. Waited on here because step 9 copies the deployment JSON
+# the job writes the registry address into.
+SCHNORR_JOB=$(kubectl get jobs -o name | grep schnorr-operators | head -1 || true)
+if [ "$SIGNATURE_SCHEME" = "schnorr" ] && [ -z "$SCHNORR_JOB" ]; then
+    echo -e "${RED}schnorr-operators job not found, but SIGNATURE_SCHEME=schnorr${NC}"
+    kubectl get jobs
+    exit 1
+fi
+if [ -n "$SCHNORR_JOB" ]; then
     echo -e "${YELLOW}Waiting for the schnorr operator-set job...${NC}"
-    SCHNORR_JOB=$(kubectl get jobs -o name | grep schnorr-operators | head -1)
-    if [ -z "$SCHNORR_JOB" ]; then
-        echo -e "${RED}schnorr-operators job not found, but SIGNATURE_SCHEME=schnorr${NC}"
-        kubectl get jobs
-        exit 1
-    fi
     echo "Found schnorr job: $SCHNORR_JOB"
     kubectl wait --for=condition=complete "$SCHNORR_JOB" --timeout=500s || {
         echo -e "${RED}schnorr-operators job failed or timed out${NC}"
@@ -378,6 +378,36 @@ case "$GAS_KILLER_API_KEY" in
 esac
 export GAS_KILLER_API_KEY
 echo -e "${GREEN}Minted API key for task submission${NC}"
+
+# The registry the operator-set job deployed has to reach GET /avs-metadata, which is what an
+# integrator reads to wire a target. The job records it on the shared volume and the router picks
+# that up as a named record, so this also proves the handoff works when the job finishes after the
+# router is already serving. Retried because the resolver runs off the request path with backoff.
+if [ -n "$SCHNORR_JOB" ]; then
+    echo -e "${YELLOW}Checking GET /avs-metadata publishes the registry...${NC}"
+    EXPECTED_REGISTRY=$(jq -r '.addresses.schnorrStakeRegistry // empty' \
+        config/.nodes/avs_deploy.json 2>/dev/null || true)
+    PUBLISHED=""
+    for _ in $(seq 1 30); do
+        PUBLISHED=$(curl -s http://localhost:8080/avs-metadata \
+            | jq -r '.contracts.schnorrStakeRegistry // empty' 2>/dev/null || true)
+        [ -n "$PUBLISHED" ] && break
+        sleep 5
+    done
+    if [ -z "$PUBLISHED" ]; then
+        echo -e "${RED}/avs-metadata never published schnorrStakeRegistry${NC}"
+        curl -s http://localhost:8080/avs-metadata || true
+        kubectl logs -l app.kubernetes.io/component=router --tail 50 || true
+        exit 1
+    fi
+    # Compared case-insensitively: the endpoint publishes EIP-55 checksummed so the addresses
+    # paste into Solidity, and the deployment JSON does not.
+    if [ "$(echo "$PUBLISHED" | tr 'A-Z' 'a-z')" != "$(echo "$EXPECTED_REGISTRY" | tr 'A-Z' 'a-z')" ]; then
+        echo -e "${RED}/avs-metadata published $PUBLISHED, but the job deployed $EXPECTED_REGISTRY${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}/avs-metadata publishes schnorrStakeRegistry=$PUBLISHED${NC}"
+fi
 
 cd scripts
 export GAS_KILLER_ROUTER_URL=http://localhost:8080
