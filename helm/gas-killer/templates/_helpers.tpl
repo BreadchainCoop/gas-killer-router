@@ -67,12 +67,17 @@ Simulation profile (GK_SIM_PROFILE) shared by the router and every node. Both de
 this one helper, so they cannot be given different values — a divergence would change the derived
 storage_updates on one side and fork the quorum's digests.
 
-Rejects unbounded whenever the deployment's own Anvil serves debug_traceCall without a lifted
-execution cap. The profile lifts the gas limits a tracked function is SIMULATED under, but an
-above-block-limit call still OOGs inside a clamped tracer — and extraction returns a truncated
-result rather than an error, so every heavy task would be silently wrong at runtime instead of
-loudly wrong at install time. Satisfied by l1.extraArgs carrying --disable-block-gas-limit, or by
+Rejects unbounded unless the deployment's own Anvil is explicitly started with its block gas limit
+disabled. Satisfied by l1.extraArgs carrying --disable-block-gas-limit, or by
 global.localAnvilUnboundedReady for an image that bakes the flag into its entrypoint.
+
+Measured on anvil 1.5.1, the flag does NOT gate debug_traceCall: a 104M-gas call traces fine on a
+default 60M-limit anvil, with or without blockOverrides, because the flag governs block
+construction rather than tracing. The gate is kept anyway because the cap that actually bites is a
+node-level one — geth's --rpc.gascap, which hosted providers set and which does clamp traces,
+silently returning a truncated result rather than an error. Requiring the flag keeps the
+simulation endpoint's cap an explicit deployment decision rather than a property of whichever
+client happens to be behind it.
 
 Says nothing about TESTNET without a sim fork: there the cap belongs to an endpoint the chart
 cannot see, which is what l1.simFork.enabled exists to bring in-cluster.

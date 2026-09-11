@@ -53,6 +53,29 @@ render-time guard accepts either.
 - [ ] Use the value `unbounded`. `unbounded-v1` panics at startup by design
       (`common/src/config.rs`).
 
+## What a local deploy of this chart actually showed
+
+Run against kind with the chart's own manifests, forking Sepolia:
+
+| | Banner `Gas Limit` | 104M-gas `debug_traceCall` |
+|---|---|---|
+| `l1.extraArgs` unset | `60000000` | completes, no error |
+| `l1.extraArgs=--disable-block-gas-limit` | `Disabled` | completes, no error |
+
+Two things follow.
+
+**The chart must supply anvil's command, and now does.** The `ghcr.io/breadchaincoop/ethereum`
+image hardcodes its entrypoint —
+`anvil --fork-url $FORK_URL --host 0.0.0.0 --port 8545 --code-size-limit 65536` — and never reads
+`ANVIL_EXTRA_ARGS`. Passing the variable as a bare env var renders green and changes nothing.
+
+**On anvil, `--disable-block-gas-limit` is not what lifts the tracing cap.** It governs block
+construction; `debug_traceCall` honours `tx.gas` either way. The cap that actually bites is
+node-level — geth's `--rpc.gascap`, which is what hosted providers clamp with and what returns a
+truncated trace instead of an error. Keep the flag (the render guard requires it, and it costs
+nothing), but if you swap anvil for geth as the simulation endpoint, `--rpc.gascap=0` is the
+setting that matters, not this one.
+
 ## Size the fork before you flip
 
 `l1.resources` defaults to 1 CPU / 2Gi, which was sized for a LOCAL Anvil serving a test chain. Under
