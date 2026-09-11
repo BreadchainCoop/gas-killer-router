@@ -53,6 +53,21 @@ render-time guard accepts either.
 - [ ] Use the value `unbounded`. `unbounded-v1` panics at startup by design
       (`common/src/config.rs`).
 
+## Size the fork before you flip
+
+`l1.resources` defaults to 1 CPU / 2Gi, which was sized for a LOCAL Anvil serving a test chain. Under
+`unbounded` this one pod executes every task's heavy simulation for the router *and* every node, and
+caches forked state in memory. A 600M-gas call is CPU-bound. Raise it with the rollout rather than
+after the first timeout:
+
+```
+  --set l1.resources.requests.cpu=2 --set l1.resources.limits.cpu=4 \
+  --set l1.resources.requests.memory=4Gi --set l1.resources.limits.memory=8Gi
+```
+
+Watch `gas_killer_evmsketch_trace_fetch_seconds` after the flip — extraction moving from the hosted
+endpoint to the fork should show up there, and a starved fork shows up as latency rather than error.
+
 ## Rollout
 
 The profile changes the derived `storage_updates` and therefore the task digest, so the router and
