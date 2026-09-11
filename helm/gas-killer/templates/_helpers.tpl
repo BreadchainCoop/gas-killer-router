@@ -49,24 +49,43 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Whether the bundled Anvil runs as a simulation fork beside an external chain RPC.
+
+Distinct from LOCAL mode, where the same workload is the chain itself rather than a fork of one.
+Rendered as a string so callers can test it: `include "gas-killer.simFork.enabled" . | eq "true"`.
+*/}}
+{{- define "gas-killer.simFork.enabled" -}}
+{{- if and .Values.l1.enabled .Values.secrets.forkUrl (.Values.l1.simFork).enabled (ne .Values.global.environment "LOCAL") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
+{{/*
 Simulation profile (GK_SIM_PROFILE) shared by the router and every node. Both deployments render
 this one helper, so they cannot be given different values — a divergence would change the derived
 storage_updates on one side and fork the quorum's digests.
 
-Rejects the LOCAL + unbounded combination unless it is explicitly acknowledged. The profile
-lifts the gas limits a tracked function is SIMULATED under, but executing an above-block-limit
-call also needs the node serving debug_traceCall to have its own execution cap lifted. In LOCAL
-mode that node is the bundled Anvil, whose flags come from the ethereum image's entrypoint rather
-than this chart, so the chart cannot make the deployment work on its own — without the flag every
-heavy task fails analysis at runtime instead of at install time.
+Rejects unbounded whenever the deployment's own Anvil serves debug_traceCall without a lifted
+execution cap. The profile lifts the gas limits a tracked function is SIMULATED under, but an
+above-block-limit call still OOGs inside a clamped tracer — and extraction returns a truncated
+result rather than an error, so every heavy task would be silently wrong at runtime instead of
+loudly wrong at install time. Satisfied by l1.extraArgs carrying --disable-block-gas-limit, or by
+global.localAnvilUnboundedReady for an image that bakes the flag into its entrypoint.
+
+Says nothing about TESTNET without a sim fork: there the cap belongs to an endpoint the chart
+cannot see, which is what l1.simFork.enabled exists to bring in-cluster.
 */}}
 {{- define "gas-killer.simProfile" -}}
 {{- $profile := .Values.global.simProfile | default "chain" -}}
 {{- if not (has $profile (list "chain" "unbounded")) -}}
 {{- fail (printf "global.simProfile must be \"chain\" or \"unbounded\", got %q" $profile) -}}
 {{- end -}}
-{{- if and (eq $profile "unbounded") (eq .Values.global.environment "LOCAL") (not .Values.global.localAnvilUnboundedReady) -}}
-{{- fail "global.simProfile=unbounded in LOCAL mode requires the bundled Anvil to run with --disable-block-gas-limit, which comes from the ethereum image's entrypoint and not this chart. Set global.localAnvilUnboundedReady=true to confirm the image provides it." -}}
+{{- $bundledAnvil := or (eq .Values.global.environment "LOCAL") (include "gas-killer.simFork.enabled" . | eq "true") -}}
+{{- $capLifted := or (contains "--disable-block-gas-limit" (.Values.l1.extraArgs | default "")) .Values.global.localAnvilUnboundedReady -}}
+{{- if and (eq $profile "unbounded") $bundledAnvil (not $capLifted) -}}
+{{- fail "global.simProfile=unbounded needs the bundled Anvil to run with --disable-block-gas-limit, or an above-block-limit call OOGs inside the tracer and analysis returns a truncated payload instead of an error. Set l1.extraArgs=\"--disable-block-gas-limit\", or global.localAnvilUnboundedReady=true if the ethereum image already supplies it." -}}
 {{- end -}}
 {{- $profile -}}
 {{- end }}

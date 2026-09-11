@@ -1,5 +1,5 @@
-{{- if and .Values.l1.enabled .Values.secrets.forkUrl (eq .Values.global.environment "LOCAL") }}
-{{- /* L1 (Anvil) deployment - only in LOCAL mode */ -}}
+{{- if and .Values.l1.enabled .Values.secrets.forkUrl (or (eq .Values.global.environment "LOCAL") (include "gas-killer.simFork.enabled" . | eq "true")) }}
+{{- /* L1 (Anvil) deployment - the chain itself in LOCAL mode, a simulation fork when l1.simFork.enabled */ -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,6 +33,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "gas-killer.secret.fullname" . }}
                   key: FORK_URL
+            - name: ANVIL_EXTRA_ARGS
+              value: {{ .Values.l1.extraArgs | default "" | quote }}
           ports:
             - name: rpc
               containerPort: 8545
