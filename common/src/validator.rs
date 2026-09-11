@@ -339,6 +339,10 @@ fn executor_cache_capacity(num_chains: usize) -> usize {
 pub struct GasKillerValidator {
     /// RPC URLs per chain for the gas analyzer
     chain_rpc_urls: HashMap<ChainRole, String>,
+    /// RPC URLs per chain that extraction and gas estimation run against. Defaults to
+    /// `chain_rpc_urls`; `SIM_HTTP_RPC` points it at a node with a lifted `debug_traceCall` cap,
+    /// which `SimProfile::Unbounded` needs and hosted endpoints clamp silently.
+    sim_rpc_urls: HashMap<ChainRole, String>,
     /// Read-only providers per chain for chain detection and `stateTransitionCount` reads.
     providers: Arc<HashMap<ChainRole, ReadOnlyProvider>>,
     /// Default chain for backwards compatibility
@@ -371,10 +375,12 @@ impl GasKillerValidator {
     /// Reads RPC URLs from environment variables:
     /// - `HTTP_RPC` for L1 (required)
     /// - `L2_HTTP_RPC` for L2 (optional)
+    /// - `SIM_HTTP_RPC` / `L2_SIM_HTTP_RPC` for simulation (optional, default to the above)
     ///
     /// Returns an error if L1 RPC is not set.
     pub fn new() -> Result<Self> {
         let chain_rpc_urls = crate::chain_rpc_urls_from_env()?;
+        let sim_rpc_urls = crate::sim_rpc_urls_from_env(&chain_rpc_urls)?;
         let capacity = executor_cache_capacity(chain_rpc_urls.len());
         let providers = Arc::new(crate::build_read_providers(&chain_rpc_urls));
         if !providers.contains_key(&ChainRole::L1) {
@@ -382,6 +388,7 @@ impl GasKillerValidator {
         }
 
         Ok(Self {
+            sim_rpc_urls,
             chain_rpc_urls,
             providers,
             default_chain: ChainRole::L1,
@@ -404,6 +411,7 @@ impl GasKillerValidator {
         let capacity = executor_cache_capacity(chain_rpc_urls.len());
         let providers = Arc::new(crate::build_read_providers(&chain_rpc_urls));
         Self {
+            sim_rpc_urls: chain_rpc_urls.clone(),
             chain_rpc_urls,
             providers,
             default_chain: ChainRole::L1,
@@ -420,6 +428,7 @@ impl GasKillerValidator {
         let capacity = executor_cache_capacity(chain_rpc_urls.len());
         let providers = Arc::new(crate::build_read_providers(&chain_rpc_urls));
         Self {
+            sim_rpc_urls: chain_rpc_urls.clone(),
             chain_rpc_urls,
             providers,
             default_chain: ChainRole::L1,
@@ -448,6 +457,15 @@ impl GasKillerValidator {
     /// Returns the RPC URL for a specific chain
     pub fn rpc_url_for_chain(&self, chain_id: ChainRole) -> Option<&str> {
         self.chain_rpc_urls.get(&chain_id).map(|s| s.as_str())
+    }
+
+    /// Returns the RPC URL a tracked function is simulated against for a specific chain.
+    ///
+    /// Equal to [`Self::rpc_url_for_chain`] unless `SIM_HTTP_RPC` is set. Every party that
+    /// re-derives a task's `storage_updates` must read the same one, or the router and the nodes
+    /// sign different digests.
+    pub fn sim_rpc_url_for_chain(&self, chain_id: ChainRole) -> Option<&str> {
+        self.sim_rpc_urls.get(&chain_id).map(|s| s.as_str())
     }
 
     /// Returns whether a chain is supported
@@ -568,10 +586,11 @@ impl GasKillerValidator {
         );
 
         let rpc_url = self
-            .rpc_url_for_chain(chain_role)
+            .sim_rpc_url_for_chain(chain_role)
             .ok_or_else(|| anyhow::anyhow!("No RPC URL configured for chain: {}", chain_role))?;
 
-        // Fetch the actual EVM chain ID from the RPC we're already using for EVMSketch.
+        // Read the chain ID from the chain RPC rather than the simulation one: a fork reports its
+        // upstream's ID, but it is the settling chain the commitment is bound to.
         let numeric_chain_id = self.get_chain_id_for(chain_role).await?;
 
         let result = self
@@ -789,7 +808,7 @@ impl GasKillerValidator {
 
         // Get the RPC URL for the detected chain
         let rpc_url = self
-            .rpc_url_for_chain(chain_id)
+            .sim_rpc_url_for_chain(chain_id)
             .ok_or_else(|| anyhow::anyhow!("No RPC URL configured for chain: {}", chain_id))?;
 
         debug!(

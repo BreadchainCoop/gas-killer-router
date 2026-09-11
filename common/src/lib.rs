@@ -23,7 +23,7 @@ pub use config::{
 };
 pub use metrics::ConfigMetrics;
 pub use payload::{BundleProof, PayloadView, TaskBundle};
-pub use providers::{build_read_providers, chain_rpc_urls_from_env};
+pub use providers::{build_read_providers, chain_rpc_urls_from_env, sim_rpc_urls_from_env};
 pub use task_data::GasKillerTaskData;
 pub use validator::{GasKillerValidator, ValidatorMetrics};
 

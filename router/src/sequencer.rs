@@ -281,7 +281,7 @@ impl GasKillerTaskSource {
                 .map_err(|e| anyhow::anyhow!("Failed to detect chain: {}", e))?;
             let rpc_url = self
                 .validator
-                .rpc_url_for_chain(chain_role)
+                .sim_rpc_url_for_chain(chain_role)
                 .ok_or_else(|| anyhow::anyhow!("No RPC URL for chain {}", chain_role))?
                 .to_owned();
 
