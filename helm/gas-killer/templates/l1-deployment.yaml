@@ -1,5 +1,5 @@
-{{- if and .Values.l1.enabled .Values.secrets.forkUrl (eq .Values.global.environment "LOCAL") }}
-{{- /* L1 (Anvil) deployment - only in LOCAL mode */ -}}
+{{- if and .Values.l1.enabled .Values.secrets.forkUrl (or (eq .Values.global.environment "LOCAL") (include "gas-killer.simFork.enabled" . | eq "true")) }}
+{{- /* L1 (Anvil) deployment - the chain itself in LOCAL mode, a simulation fork when l1.simFork.enabled */ -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,12 +27,26 @@ spec:
         - name: l1
           image: "{{ .Values.l1.image.repository }}:{{ .Values.l1.image.tag }}"
           imagePullPolicy: {{ .Values.l1.image.pullPolicy }}
+          # Supplied here rather than left to the image's entrypoint, which bakes its flags in and
+          # would ignore ANVIL_EXTRA_ARGS — the render-time guard would pass while the fork came up
+          # still capped, which is the failure this whole path exists to remove. Mirrors the
+          # docker-compose command the e2e legs run against this same image.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              exec anvil --fork-url "$FORK_URL" --host 0.0.0.0 --port 8545 \
+                --code-size-limit 65536 \
+                --timeout 120000 \
+                --retries 5 \
+                --compute-units-per-second 300 $ANVIL_EXTRA_ARGS
           env:
             - name: FORK_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "gas-killer.secret.fullname" . }}
                   key: FORK_URL
+            - name: ANVIL_EXTRA_ARGS
+              value: {{ .Values.l1.extraArgs | default "" | quote }}
           ports:
             - name: rpc
               containerPort: 8545

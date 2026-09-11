@@ -97,7 +97,9 @@ See `values.yaml` for all available configuration options.
 | `global.nodeCount` | Number of operator nodes | `3` |
 | `global.initTimeout` | Init container timeout in seconds | `300` |
 | `global.simProfile` | Tracked-function simulation profile (`chain` or `unbounded`), shared by the router and every node so their signed payloads agree. `unbounded` simulates under the pinned unbounded gas limits, allowing functions whose direct execution exceeds the block gas limit; it needs the RPC's execution cap lifted and pairs with `global.stateEncoding=prestate-net`. **Not production-ready — see the preconditions in `values.yaml` and gas-killer/service#356.** | `chain` |
-| `global.localAnvilUnboundedReady` | Confirms the ethereum image starts Anvil with `--disable-block-gas-limit`. Rendering fails on `global.environment=LOCAL` with `global.simProfile=unbounded` until this is set, since that flag lives in the image rather than the chart. | `false` |
+| `global.localAnvilUnboundedReady` | Confirms the ethereum image starts Anvil with `--disable-block-gas-limit`. An escape hatch for an image that bakes the flag in; prefer `l1.extraArgs`, which the chart can set directly. | `false` |
+| `l1.simFork.enabled` | Runs the bundled Anvil as a **simulation fork** beside an external chain RPC, and points the router and every node at it via `SIM_HTTP_RPC`. Settlement and chain reads stay on `secrets.httpRpc`, so the fork never sees a transaction. This is what makes `global.simProfile=unbounded` usable against a hosted provider, whose `debug_traceCall` cap is clamped silently. Requires `secrets.forkUrl`. | `false` |
+| `l1.extraArgs` | Appended to the bundled Anvil's command line (`ANVIL_EXTRA_ARGS`). `--disable-block-gas-limit` is required whenever `global.simProfile=unbounded` runs against a chart-managed Anvil — rendering fails otherwise. | `""` |
 | `secrets.forkUrl` | Anvil fork URL (required for LOCAL mode) | `""` |
 | `secrets.privateKey` | Deployer private key | `""` |
 | `secrets.fundedKey` | Funded account private key | `""` |

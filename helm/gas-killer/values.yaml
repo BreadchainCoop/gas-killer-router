@@ -204,6 +204,24 @@ secrets:
 # L1 (Anvil) configuration - only used in LOCAL mode
 l1:
   enabled: true
+
+  # Run the bundled Anvil as a SIMULATION fork beside an external chain RPC, instead of only in
+  # LOCAL mode where it is the chain itself. Extraction (SIM_HTTP_RPC) is pointed at it while
+  # settlement, chain detection and stateTransitionCount reads stay on secrets.httpRpc, so the
+  # fork never sees a transaction.
+  #
+  # This is what makes global.simProfile: "unbounded" usable against a hosted provider: the
+  # profile simulates under 2^40 gas limits, and hosted debug_traceCall endpoints clamp well below
+  # that without reporting it — they return a truncated trace, not an error. Forking gives the
+  # fleet a node whose cap it controls. Needs secrets.forkUrl set to the chain the fork tracks.
+  simFork:
+    enabled: false
+
+  # Appended to the bundled Anvil's command line (ANVIL_EXTRA_ARGS). The unbounded profile needs
+  # --disable-block-gas-limit here, without which an above-block-limit call OOGs inside the tracer
+  # and analysis returns a truncated result rather than failing.
+  extraArgs: ""
+
   image:
     repository: ghcr.io/breadchaincoop/ethereum
     tag: latest

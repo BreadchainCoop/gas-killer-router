@@ -233,6 +233,12 @@ spec:
             - name: WS_RPC
               value: "ws://{{ include "gas-killer.l1.fullname" $root }}:{{ $root.Values.l1.service.port }}"
             {{- end }}
+            {{- if include "gas-killer.simFork.enabled" $root | eq "true" }}
+            # Extraction runs against the in-cluster fork, whose debug_traceCall cap this chart
+            # sets; everything else stays on HTTP_RPC so settlement reaches the real chain.
+            - name: SIM_HTTP_RPC
+              value: "http://{{ include "gas-killer.l1.fullname" $root }}:{{ $root.Values.l1.service.port }}"
+            {{- end }}
             {{- if $root.Values.l2.enabled }}
             {{- if eq $root.Values.global.environment "LOCAL" }}
             - name: L2_HTTP_RPC
