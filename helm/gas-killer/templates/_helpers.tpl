@@ -56,6 +56,34 @@ Rendered as a string so callers can test it: `include "gas-killer.simFork.enable
 */}}
 {{- define "gas-killer.simFork.enabled" -}}
 {{- if and .Values.l1.enabled .Values.secrets.forkUrl (.Values.l1.simFork).enabled (ne .Values.global.environment "LOCAL") -}}
+{{- if (.Values.simRpc).url -}}
+{{- fail "simRpc.url and l1.simFork.enabled both set: the fleet simulates against exactly one endpoint. Unset one." -}}
+{{- end -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
+{{/*
+The URL the router and every node simulate against (SIM_HTTP_RPC), or empty to leave extraction
+on HTTP_RPC. One helper for both deployments so they cannot disagree — a divergence would change
+storage_updates on one side and fork the quorum's digests, exactly like simProfile.
+*/}}
+{{- define "gas-killer.simRpcUrl" -}}
+{{- if (.Values.simRpc).url -}}
+{{- .Values.simRpc.url -}}
+{{- else if include "gas-killer.simFork.enabled" . | eq "true" -}}
+{{- printf "http://%s:%v" (include "gas-killer.l1.fullname" .) .Values.l1.service.port -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the sim fork runs behind the re-fork proxy sidecar. Only meaningful for a sim fork: in
+LOCAL mode Anvil is the chain, its blocks are its own, and nothing needs re-forking.
+*/}}
+{{- define "gas-killer.simFork.refork" -}}
+{{- if and (include "gas-killer.simFork.enabled" . | eq "true") ((.Values.l1.simFork).refork).enabled -}}
 true
 {{- else -}}
 false

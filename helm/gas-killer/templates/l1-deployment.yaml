@@ -1,5 +1,18 @@
 {{- if and .Values.l1.enabled .Values.secrets.forkUrl (or (eq .Values.global.environment "LOCAL") (include "gas-killer.simFork.enabled" . | eq "true")) }}
 {{- /* L1 (Anvil) deployment - the chain itself in LOCAL mode, a simulation fork when l1.simFork.enabled */ -}}
+{{- if include "gas-killer.simFork.refork" . | eq "true" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gas-killer.l1.fullname" . }}-refork-proxy
+  labels:
+    {{- include "gas-killer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: l1
+data:
+  refork-proxy.py: |
+{{ .Files.Get "files/refork-proxy.py" | indent 4 }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,6 +22,11 @@ metadata:
     app.kubernetes.io/component: l1
 spec:
   replicas: 1
+  # One replica with nothing durable in it: a rolling update would need a second 2-4 CPU pod
+  # scheduled beside the first, which a small node pool cannot fit, and a second fork would not
+  # share the first's state anyway. Take the short outage instead.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "gas-killer.selectorLabels" . | nindent 6 }}
@@ -18,6 +36,12 @@ spec:
       labels:
         {{- include "gas-killer.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: l1
+      {{- if include "gas-killer.simFork.refork" . | eq "true" }}
+      annotations:
+        # A ConfigMap edit alone does not restart the pod, and the proxy reads its script once
+        # at start; hashing it here rolls the pod whenever the script changes.
+        checksum/refork-proxy: {{ .Files.Get "files/refork-proxy.py" | sha256sum }}
+      {{- end }}
     spec:
       # Prioritize keeping L1 pod running - it holds critical state
       {{- if .Values.l1.priorityClassName }}
@@ -65,6 +89,51 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.l1.resources | nindent 12 }}
+        {{- if include "gas-killer.simFork.refork" . | eq "true" }}
+        # Re-forks Anvil to the block each request asks for; see files/refork-proxy.py. Without it
+        # a task anchored past the fork block cannot be simulated at all.
+        - name: refork-proxy
+          image: "{{ .Values.l1.simFork.refork.image.repository }}:{{ .Values.l1.simFork.refork.image.tag }}"
+          imagePullPolicy: {{ .Values.l1.simFork.refork.image.pullPolicy }}
+          command: ["python3", "-u", "/opt/refork/refork-proxy.py"]
+          env:
+            - name: ANVIL_URL
+              value: "http://127.0.0.1:8545"
+            - name: LISTEN_PORT
+              value: {{ .Values.l1.simFork.refork.port | quote }}
+            - name: FORK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gas-killer.secret.fullname" . }}
+                  key: FORK_URL
+          ports:
+            - name: sim
+              containerPort: {{ .Values.l1.simFork.refork.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: sim
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: sim
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          volumeMounts:
+            - name: refork-proxy
+              mountPath: /opt/refork
+              readOnly: true
+          resources:
+            {{- toYaml .Values.l1.simFork.refork.resources | nindent 12 }}
+      volumes:
+        - name: refork-proxy
+          configMap:
+            name: {{ include "gas-killer.l1.fullname" . }}-refork-proxy
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -77,7 +146,9 @@ spec:
   type: {{ .Values.l1.service.type }}
   ports:
     - port: {{ .Values.l1.service.port }}
-      targetPort: rpc
+      # Through the re-fork proxy when it runs, so SIM_HTTP_RPC gets a fork that follows the
+      # task's block; straight to Anvil otherwise (LOCAL mode, where it is the chain itself).
+      targetPort: {{ ternary "sim" "rpc" (include "gas-killer.simFork.refork" . | eq "true") }}
       protocol: TCP
       name: rpc
   selector:

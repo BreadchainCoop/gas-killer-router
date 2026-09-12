@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sim-node
+description: In-cluster Sepolia node (reth + lighthouse) serving as the Gas Killer fleet's simulation endpoint (SIM_HTTP_RPC) with the execution gas cap lifted.
+type: application
+version: 0.1.0
+appVersion: "reth-2.5.2"
