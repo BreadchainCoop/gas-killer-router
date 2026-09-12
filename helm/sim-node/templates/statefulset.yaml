@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "sim-node.name" . }}
+  labels:
+    {{- include "sim-node.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "sim-node.name" . }}-headless
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sim-node.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sim-node.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # A trace of a 2^40-gas call may run for many minutes; give it time to finish on a roll.
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: reth
+          image: "{{ .Values.reth.image.repository }}:{{ .Values.reth.image.tag }}"
+          imagePullPolicy: {{ .Values.reth.image.pullPolicy }}
+          args:
+            - node
+            - --chain={{ .Values.network }}
+            - --datadir=/data
+            - --http
+            - --http.addr=0.0.0.0
+            - --http.port=8545
+            - --http.api=eth,net,web3,debug,trace,txpool
+            - --ws
+            - --ws.addr=0.0.0.0
+            - --ws.port=8546
+            - --ws.api=eth,net,web3,debug,trace
+            - --authrpc.addr=127.0.0.1
+            - --authrpc.port=8551
+            - --authrpc.jwtsecret=/jwt/jwt.hex
+            - --metrics=0.0.0.0:9001
+            {{- range .Values.reth.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8545
+            - name: ws
+              containerPort: 8546
+            - name: metrics
+              containerPort: 9001
+            - name: p2p-tcp
+              containerPort: 30303
+              protocol: TCP
+            - name: p2p-udp
+              containerPort: 30303
+              protocol: UDP
+          # Liveness only: readiness would take the Service away during the hours of initial sync,
+          # and the fleet is pointed here only once it is synced and verified.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 10
+          volumeMounts:
+            - name: reth-data
+              mountPath: /data
+            - name: jwt
+              mountPath: /jwt
+              readOnly: true
+          resources:
+            {{- toYaml .Values.reth.resources | nindent 12 }}
+        - name: lighthouse
+          image: "{{ .Values.lighthouse.image.repository }}:{{ .Values.lighthouse.image.tag }}"
+          imagePullPolicy: {{ .Values.lighthouse.image.pullPolicy }}
+          args:
+            - lighthouse
+            - bn
+            - --network={{ .Values.network }}
+            - --datadir=/data
+            - --execution-endpoint=http://127.0.0.1:8551
+            - --execution-jwt=/jwt/jwt.hex
+            - --checkpoint-sync-url={{ .Values.lighthouse.checkpointSyncUrl }}
+            - --http
+            - --http-address=127.0.0.1
+            - --http-port=5052
+            - --disable-upnp
+            {{- range .Values.lighthouse.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: cl-p2p-tcp
+              containerPort: 9000
+              protocol: TCP
+            - name: cl-p2p-udp
+              containerPort: 9000
+              protocol: UDP
+          volumeMounts:
+            - name: lighthouse-data
+              mountPath: /data
+            - name: jwt
+              mountPath: /jwt
+              readOnly: true
+          resources:
+            {{- toYaml .Values.lighthouse.resources | nindent 12 }}
+      volumes:
+        - name: jwt
+          secret:
+            secretName: {{ include "sim-node.name" . }}-jwt
+  volumeClaimTemplates:
+    - metadata:
+        name: reth-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.reth.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.reth.storage.size }}
+    - metadata:
+        name: lighthouse-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.lighthouse.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.lighthouse.storage.size }}

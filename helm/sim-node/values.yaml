@@ -1,0 +1,95 @@
+# A Sepolia full node the fleet simulates against. Exists because hosted providers clamp
+# debug_traceCall silently (service#442) and an anvil fork of a hosted provider cannot hold the
+# working set of a heavy target locally (24k+ code chunks refetched after every re-fork). reth is
+# deliberate: anvil is revm too, so callTracer/prestateTracer output matches what the fleet has
+# always been tested against (gas-analyzer#178: geth orders callTracer logs differently).
+#
+# Nothing here is a consensus input on its own — the fleet must all read ONE endpoint — but the
+# node's own cap is: --rpc.gascap max is what makes GK_SIM_PROFILE=unbounded truthful here.
+
+network: sepolia
+
+reth:
+  image:
+    repository: ghcr.io/paradigmxyz/reth
+    tag: v2.5.2
+    pullPolicy: IfNotPresent
+  # --full keeps recent state only; tasks anchor at the head and PAYLOAD_EXPIRED closes the
+  # window at ~50 blocks, so the pruned history is never asked for.
+  extraArgs:
+    - --full
+    - --rpc.gascap=max
+    - --rpc.eth-proof-window=86400
+    - --rpc.max-response-size=512
+    - --rpc.max-tracing-requests=8
+    # MDBX read transactions default to a 300 s timeout ("read transaction has been timed out
+    # (-96000)"), which is exactly what a multi-minute eth_call/debug_traceCall runs into: a
+    # 663 Ggas call died at 336 s. 2 h covers a ~30 min trace with margin; 0 would disable it
+    # but lets a stuck reader block page reclamation forever.
+    - --db.read-transaction-timeout=7200
+  resources:
+    requests:
+      cpu: "4"
+      memory: 16Gi
+    limits:
+      cpu: "7"
+      memory: 26Gi
+  # Sepolia full node was ~890 GB uncompressed from the 2026-09 snapshot; leave headroom.
+  storage:
+    className: premium-rwo
+    size: 2Ti
+
+lighthouse:
+  image:
+    repository: sigp/lighthouse
+    tag: v8.2.2
+    pullPolicy: IfNotPresent
+  # Checkpoint sync: minutes to a live head instead of days from genesis.
+  checkpointSyncUrl: https://sepolia.checkpoint-sync.ethpandaops.io
+  extraArgs: []
+  resources:
+    requests:
+      cpu: "1"
+      memory: 3Gi
+    limits:
+      cpu: "2"
+      memory: 5Gi
+  storage:
+    className: standard-rwo
+    size: 200Gi
+
+# Seed the datadir from a published snapshot instead of syncing from genesis (which is a day of
+# execution for Sepolia). publicnode publishes reth "base" + "part" archives (storage.v2): the
+# part is extracted over the base. Procedure: `--set replicas=0 --set snapshot.restore.enabled=true`
+# (the node must not be writing), wait for the Job, then `--set replicas=1 --set
+# snapshot.restore.enabled=false`. The Job wipes the datadir first. Match nodeVersion to reth.image.tag.
+replicas: 1
+snapshot:
+  restore:
+    enabled: false
+    urls:
+      - https://snapshots.publicnode.com/ethereum-sepolia-reth-base.tar.lz4
+      - https://snapshots.publicnode.com/ethereum-sepolia-reth-part.tar.lz4
+    image: alpine:3.20
+    resources:
+      requests:
+        cpu: "3"
+        memory: 2Gi
+      limits:
+        cpu: "6"
+        memory: 4Gi
+
+service:
+  type: ClusterIP
+  httpPort: 8545
+  wsPort: 8546
+
+# Keep the node off the pool the fleet runs on: it is CPU- and IO-heavy during sync and a
+# 2^40-gas trace is CPU-bound afterwards.
+nodeSelector:
+  gaskiller.xyz/role: sim-node
+tolerations:
+  - key: gaskiller.xyz/sim-node
+    operator: Equal
+    value: "true"
+    effect: NoSchedule

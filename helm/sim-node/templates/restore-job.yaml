@@ -1,0 +1,55 @@
+{{- if .Values.snapshot.restore.enabled }}
+{{- if ne (int .Values.replicas) 0 }}
+{{- fail "snapshot.restore.enabled needs replicas=0: the node must not write the datadir while it is replaced" }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sim-node.name" . }}-snapshot-restore
+  labels:
+    {{- include "sim-node.labels" . | nindent 4 }}
+    job: snapshot-restore
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        {{- include "sim-node.labels" . | nindent 8 }}
+        job: snapshot-restore
+    spec:
+      restartPolicy: Never
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: restore
+          image: {{ .Values.snapshot.restore.image | quote }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache curl lz4 tar >/dev/null
+              echo "[$(date -u +%FT%TZ)] wiping datadir"; rm -rf /data/* /data/.[!.]* 2>/dev/null || true
+              df -h /data
+              {{- range .Values.snapshot.restore.urls }}
+              echo "[$(date -u +%FT%TZ)] streaming {{ . }}"
+              curl -sSfL -A 'curl/8.4.0' --retry 5 --retry-all-errors {{ . | quote }} | lz4 -d - - | tar -x -C /data
+              echo "[$(date -u +%FT%TZ)] done"; du -sh /data
+              {{- end }}
+              echo RESTORE_COMPLETE
+          resources:
+            {{- toYaml .Values.snapshot.restore.resources | nindent 12 }}
+          volumeMounts:
+            - name: reth-data
+              mountPath: /data
+      volumes:
+        - name: reth-data
+          persistentVolumeClaim:
+            claimName: reth-data-{{ include "sim-node.name" . }}-0
+{{- end }}
